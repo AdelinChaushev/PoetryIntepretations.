@@ -157,14 +157,39 @@ def require_api_key(env_var: str) -> str:
 # Data acquisition and filtering
 # ---------------------------------------------------------------------------
 
+#: PoetryDB: a fixed anthology of 129 authors, free, no API key.
 POETRYDB_BASE_URL: str = "https://poetrydb.org"
+
+#: The API errors intermittently, so retries are the expected path rather than
+#: an exceptional one. Backoff doubles each attempt from this base.
 FETCH_MAX_RETRIES: int = 5
 FETCH_BACKOFF_SECONDS: float = 1.0
+FETCH_TIMEOUT_SECONDS: float = 30.0
 
-#: Target corpus size after the full filtering funnel. PoetryDB is a fixed
-#: anthology, so verify on day 1 that this many poems survive before relying
-#: on it — report the real number if it falls short.
-N_POEMS: int = 20 if SMOKE else 2000
+#: PoetryDB returns 403 to urllib's default ``Python-urllib/x.y`` user agent,
+#: so one must be set explicitly. Identifying the project is also just polite
+#: to a free service.
+FETCH_USER_AGENT: str = "poetry-grounding/0.1 (SoftUni course project)"
+
+#: Pause between author requests. Not required by the API, but the whole
+#: anthology is 129 requests against a free service — there is no reason to
+#: hammer it.
+FETCH_DELAY_SECONDS: float = 0.3
+
+#: Under SMOKE, fetch only this many authors so the module runs end-to-end in
+#: seconds. The full run takes all 129.
+SMOKE_MAX_AUTHORS: int = 2
+
+#: Cap on corpus size. ``None`` means NO CAP: every in-range poem gets a
+#: teacher call, and the corpus is whatever survives the funnel. The surviving
+#: count is measured and reported, never targeted — a target would either waste
+#: teacher calls on poems that get filtered out anyway, or silently truncate a
+#: corpus that came out larger than expected.
+#:
+#: Day-1 measurement: 3,156 poems fetched from 129 authors, of which 2,498 fall
+#: within the line bounds below. What survives the rest of the funnel is not
+#: knowable until the teacher has run.
+N_POEMS: int | None = 20 if SMOKE else None
 
 #: Line-count bounds. A cheap pre-filter only; MAX_SEQ_LEN below is the real
 #: constraint. The upper bound is set by GPU memory and step time across ~19
@@ -300,7 +325,11 @@ CHECKPOINT_EVERY_STEPS: int = 250
 #: threshold so the curve can be compared against Zhou et al. 2023.
 RANK_SWEEP: tuple[int, ...] = (4, 8, 16)
 LR_SWEEP: tuple[float, ...] = (1e-4, 2e-4, 5e-4)
-DATA_SIZE_SWEEP: tuple[int, ...] = (200, 500, 1000, 2000)
+
+#: ``None`` is the full surviving corpus, whatever size that turns out to be.
+#: The finite points straddle LIMA's 1,000-example threshold (Zhou et al. 2023)
+#: so the saturation curve can be compared against theirs.
+DATA_SIZE_SWEEP: tuple[int | None, ...] = (200, 500, 1000, None)
 MASKING_SWEEP: tuple[str, ...] = ("masked", "unmasked")
 
 #: Adapter ranks used by the final evaluated arms.
@@ -427,7 +456,8 @@ def summary() -> str:
         f"judge (primary): {PRIMARY_JUDGE.model}",
         f"judge (2nd)    : {SECONDARY_JUDGE.model}  [robustness only]",
         "",
-        f"corpus target  : {N_POEMS} poems, {MIN_LINES}-{MAX_LINES} lines",
+        f"corpus cap     : {N_POEMS if N_POEMS else 'none (all survivors)'}, "
+        f"{MIN_LINES}-{MAX_LINES} lines",
         f"interpretation : {MIN_WORDS}-{MAX_WORDS} words",
         f"max seq len    : {MAX_SEQ_LEN} tokens (drop, never truncate)",
         "",

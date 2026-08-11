@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poetry-grounding"
+version = "0.1.0"
+description = "Measuring grounding in a LoRA-fine-tuned language model"
+requires-python = ">=3.10"
+
+# Kept deliberately small. Training-only dependencies (torch, transformers,
+# peft) are installed on Kaggle, where the GPU is; the data and evaluation
+# stages run locally and need none of them.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.1",
+    "transformers>=4.44",
+    "peft>=0.11",
+    "accelerate>=0.30",
+]
+api = [
+    "openai>=1.40",          # teacher (DeepSeek, OpenAI-compatible) + primary judge
+    "google-genai>=0.3",     # secondary judge
+]
+dev = [
+    "pytest>=8.0",
+]
+
+# `config` is a top-level module rather than a package: it is the single
+# source of truth and is imported as `import config` everywhere, including
+# inside Kaggle notebooks.
+[tool.setuptools]
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
