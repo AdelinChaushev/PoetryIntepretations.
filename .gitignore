@@ -1,0 +1,35 @@
+# Secrets — API keys live in the shell environment, never in the repo
+.env
+.env.*
+*.key
+
+# Data: the corpus is regenerable from PoetryDB and too large to track.
+# data/sample/ is the exception — a few committed examples so notebooks and
+# tests have something to run against without a full fetch.
+data/*
+!data/sample/
+!data/sample/**
+
+# results/ IS committed — runs.csv, figures and the LoRA adapters are part of
+# the deliverable. Only transient checkpoints are excluded.
+results/checkpoints/
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+.virtual_documents/
+
+# macOS
+.DS_Store
+
+# Claude Code — local tooling, not part of the deliverable
+.claude/
+CLAUDE.md
