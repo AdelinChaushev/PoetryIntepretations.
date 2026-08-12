@@ -1,0 +1,31 @@
+# Pinned to the versions this project was developed and tested against.
+#
+# `pip install -e .` reads pyproject.toml and is the preferred route locally.
+# This file exists for Kaggle, where the notebook installs into a fresh
+# session and reproducibility matters more than flexibility.
+#
+# Split by where it runs: only the training block needs a GPU, and only the
+# API block needs credentials.
+
+# --- data pipeline, evaluation, figures (laptop, CPU) ---------------------
+numpy==2.3.5
+pandas==2.3.3
+scipy==1.16.3
+matplotlib==3.10.6
+
+# Tokeniser only — the funnel's token-budget filter must measure with the real
+# tokeniser rather than estimate. Works without torch.
+transformers==5.15.0
+
+# --- teacher and judges (laptop, needs API keys in the environment) --------
+openai==2.53.0          # DeepSeek teacher (OpenAI-compatible) + GPT-4o-mini judge
+google-genai==2.17.0    # Gemini Flash judge
+
+# --- training (Kaggle GPU only; not installed locally) ---------------------
+# torch>=2.1
+# transformers>=4.44
+# peft>=0.11
+# accelerate>=0.30
+
+# --- development ----------------------------------------------------------
+pytest==8.4.2

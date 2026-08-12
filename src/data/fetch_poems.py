@@ -52,29 +52,43 @@ def make_poem_id(author: str, title: str) -> str:
     return f"{_slug(author, 20)}--{_slug(title)}--{digest}"
 
 
-def _get_json(url: str) -> object:
+def _get_json(url: str, max_retries: int | None = None,
+              timeout: float | None = None) -> object:
     """GET ``url`` and parse JSON, retrying with exponential backoff.
 
-    PoetryDB errors intermittently. Retries are the expected path, not an
-    exceptional one, so a failure only raises after every attempt is used.
+    PoetryDB errors intermittently, so retries are the expected path rather
+    than an exceptional one, and a failure only raises once every attempt is
+    used.
+
+    ``max_retries`` is lowered by callers that have a fallback available.
+    Retrying hard is right when there is no alternative; when there is one,
+    burning 31 seconds of backoff on a failure that is already known to be
+    permanent just delays the recovery.
     """
+    if max_retries is None:
+        max_retries = config.FETCH_MAX_RETRIES
+    if timeout is None:
+        timeout = config.FETCH_TIMEOUT_SECONDS
+
     # An explicit User-Agent is required: PoetryDB returns 403 to urllib's
     # default `Python-urllib/x.y`.
     request = Request(url, headers={"User-Agent": config.FETCH_USER_AGENT})
 
     last_error: Exception | None = None
-    for attempt in range(config.FETCH_MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
-            with urlopen(request, timeout=config.FETCH_TIMEOUT_SECONDS) as response:
+            with urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as error:  # network, timeout, or malformed JSON
             last_error = error
+            if attempt + 1 == max_retries:
+                break
             backoff = config.FETCH_BACKOFF_SECONDS * (2**attempt)
-            log.warning("attempt %d for %s failed (%s); retrying in %.1fs",
-                        attempt + 1, url, error, backoff)
+            log.warning("attempt %d/%d for %s failed (%s); retrying in %.1fs",
+                        attempt + 1, max_retries, url, error, backoff)
             time.sleep(backoff)
-    raise RuntimeError(f"giving up on {url} after "
-                       f"{config.FETCH_MAX_RETRIES} attempts") from last_error
+    raise RuntimeError(
+        f"giving up on {url} after {max_retries} attempts") from last_error
 
 
 def fetch_author_list() -> list[str]:
@@ -113,9 +127,17 @@ def fetch_poem(author: str, title: str) -> dict | None:
     url = (f"{config.POETRYDB_BASE_URL}/author,title/"
            f"{quote(author)};{quote(title)}")
     try:
-        payload = _get_json(url)
-    except RuntimeError as error:
-        log.warning("could not fetch %r by %r: %s", title, author, error)
+        # Few retries, short timeout. A single poem that repeatedly times out
+        # is one whose response is too large to serve — which means a very long
+        # poem, which the length filter discards anyway. There
+        # is nothing to be gained by spending 165s to retrieve something that
+        # is about to be thrown away.
+        payload = _get_json(url,
+                            max_retries=config.FETCH_TITLE_RETRIES,
+                            timeout=config.FETCH_BULK_TIMEOUT_SECONDS)
+    except RuntimeError:
+        log.info("skipping %r by %r: too large to serve (would be dropped by "
+                 "the line filter regardless)", title, author)
         return None
     if isinstance(payload, dict) or not payload:
         return None
@@ -151,9 +173,15 @@ def fetch_author_poems(author: str) -> list[dict]:
     """
     url = f"{config.POETRYDB_BASE_URL}/author/{quote(author)}"
     try:
-        payload = _get_json(url)
-    except RuntimeError as error:
-        log.warning("bulk fetch failed for %r (%s)", author, error)
+        # Two attempts and a short timeout: the per-title fallback below is a
+        # better answer than a third try. The server returns its own 503 at
+        # ~15s for oversized collections, so the timeout only matters if it
+        # hangs instead of erroring — and then waiting is pure loss.
+        payload = _get_json(url,
+                            max_retries=config.FETCH_BULK_RETRIES,
+                            timeout=config.FETCH_BULK_TIMEOUT_SECONDS)
+    except RuntimeError:
+        log.info("bulk endpoint will not serve %r (likely too large)", author)
         return _fetch_author_poems_individually(author)
 
     if isinstance(payload, dict):  # PoetryDB signals "not found" as an object
@@ -246,10 +274,9 @@ def describe_corpus(poems: list[dict]) -> str:
     """
     authors = collections.Counter(poem["author"] for poem in poems)
     line_counts = sorted(poem["linecount"] for poem in poems)
-    in_range = [
-        poem for poem in poems
-        if config.MIN_LINES <= poem["linecount"] <= config.MAX_LINES
-    ]
+    from src.data.filter import within_length_bounds
+
+    in_range = [poem for poem in poems if within_length_bounds(poem)]
     with_sibling = sum(
         1 for count in collections.Counter(
             poem["author"] for poem in in_range
@@ -267,8 +294,9 @@ def describe_corpus(poems: list[dict]) -> str:
         f"raw corpus         {len(poems)} poems from {len(authors)} authors\n"
         f"lines              median {line_counts[len(line_counts) // 2]}, "
         f"min {line_counts[0]}, max {line_counts[-1]}\n"
-        f"within [{config.MIN_LINES}, {config.MAX_LINES}] lines   "
-        f"{len(in_range)} ({len(in_range) / len(poems):.0%})\n"
+        f"usable length      {len(in_range)} "
+        f"({len(in_range) / len(poems):.0%})  "
+        f"[>= {config.MIN_LINES} lines, <= {config.MAX_POEM_TOKENS} tokens]\n"
         f"authors with >= {config.MIN_POEMS_PER_AUTHOR_FOR_EVAL} in-range poems   "
         f"{with_sibling}\n"
         f"\n  largest collections — these dominate the grouped folds:\n{share}"

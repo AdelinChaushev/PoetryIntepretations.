@@ -166,6 +166,27 @@ FETCH_MAX_RETRIES: int = 5
 FETCH_BACKOFF_SECONDS: float = 1.0
 FETCH_TIMEOUT_SECONDS: float = 30.0
 
+#: Retries for the *bulk* per-author endpoint, which has a per-title fallback.
+#: Deliberately low: for the largest collections (Byron, Shelley) the 503 is
+#: permanent, and exhausting FETCH_MAX_RETRIES there burns ~31s of backoff
+#: before reaching a fallback that was always going to be needed. Retry hard
+#: only where there is no alternative.
+FETCH_BULK_RETRIES: int = 2
+
+#: Timeout for the *bulk* per-author endpoint, shorter than the general one for
+#: the same reason: that call has a fallback. PoetryDB returns its own 503 at
+#: ~15s for oversized collections, so this only bites when the server hangs
+#: rather than errors — and then every extra second is spent waiting for a
+#: failure before running a fallback that was always going to be needed.
+FETCH_BULK_TIMEOUT_SECONDS: float = 18.0
+
+#: Retries when fetching a single poem by title, during the fallback. Also
+#: deliberately low: a poem whose response repeatedly times out is a very long
+#: poem, and long poems are discarded by the [MIN_LINES, MAX_LINES] filter
+#: anyway. Spending 165s to retrieve something about to be thrown away is pure
+#: loss, and the failure is logged and skipped rather than raised.
+FETCH_TITLE_RETRIES: int = 2
+
 #: PoetryDB returns 403 to urllib's default ``Python-urllib/x.y`` user agent,
 #: so one must be set explicitly. Identifying the project is also just polite
 #: to a free service.
@@ -191,11 +212,19 @@ SMOKE_MAX_AUTHORS: int = 2
 #: knowable until the teacher has run.
 N_POEMS: int | None = 20 if SMOKE else None
 
-#: Line-count bounds. A cheap pre-filter only; MAX_SEQ_LEN below is the real
-#: constraint. The upper bound is set by GPU memory and step time across ~19
-#: training runs, not by the model's context window — Qwen2.5-0.5B has 32K.
+#: Minimum poem length, in lines. The schema asks for two or three exact
+#: quotes; below 8 lines those quotes would be most of the poem, and the
+#: grounding check would stop distinguishing "read it" from "copied it out".
 MIN_LINES: int = 8
-MAX_LINES: int = 100
+
+#: There is deliberately NO maximum line count. An earlier version capped poems
+#: at 100 lines — a number chosen by argument rather than measurement. Measuring
+#: it showed that nothing under ~150 lines systematically exceeds the token
+#: budget, and that line count is a poor proxy for token count anyway: a
+#: 193-line poem of short lines fits, while a 120-line poem of long ones does
+#: not. The cap discarded ~110 usable poems (4.4% of the corpus) by rejecting on
+#: the wrong variable. MAX_POEM_TOKENS below is the constraint that genuinely
+#: exists, and it is derived rather than picked.
 
 #: Interpretation length bounds, in words. Below the floor it is too thin to
 #: be an interpretation; above the ceiling it is padded.
@@ -208,6 +237,18 @@ MAX_WORDS: int = 250
 #: saw, silently inflating every grounding number.
 MAX_SEQ_LEN: int = 512 if SMOKE else 2048
 
+#: Tokens occupied by the prompt template plus a maximum-length interpretation,
+#: measured with the real tokeniser. Kept as a constant so importing config
+#: stays free of side effects; ``tests/test_filter.py`` recomputes it and fails
+#: if the prompt template changes without this being updated with it.
+PROMPT_OVERHEAD_TOKENS: int = 416
+
+#: Derived, not chosen: what remains of the sequence budget once the prompt and
+#: the target are accounted for. A poem longer than this cannot be trained on
+#: without truncation, and truncation is never allowed — it would let the
+#: grounding checker match quotes against text the model never saw.
+MAX_POEM_TOKENS: int = MAX_SEQ_LEN - PROMPT_OVERHEAD_TOKENS
+
 
 # ---------------------------------------------------------------------------
 # Teacher generation
@@ -215,6 +256,16 @@ MAX_SEQ_LEN: int = 512 if SMOKE else 2048
 
 #: Low enough that the four-part schema is followed reliably, high enough that
 #: the interpretations are not all the same sentence.
+#: Pause between teacher calls. ~2,500 requests against a paid API; a small
+#: delay keeps well inside rate limits and costs a few minutes overall.
+#: Abort generation if this many calls fail in a row from the start. Repeated
+#: identical failures mean something systemic — expired key, billing limit,
+#: outage — and grinding through 3,156 poems to report the same error 3,156
+#: times wastes an hour and, if the calls are partially succeeding, real money.
+GENERATE_MAX_CONSECUTIVE_FAILURES: int = 5
+
+TEACHER_DELAY_SECONDS: float = 0.2
+
 TEACHER_TEMPERATURE: float = 0.4
 TEACHER_MAX_TOKENS: int = 512
 
@@ -457,7 +508,7 @@ def summary() -> str:
         f"judge (2nd)    : {SECONDARY_JUDGE.model}  [robustness only]",
         "",
         f"corpus cap     : {N_POEMS if N_POEMS else 'none (all survivors)'}, "
-        f"{MIN_LINES}-{MAX_LINES} lines",
+        f">= {MIN_LINES} lines, <= {MAX_POEM_TOKENS} poem tokens",
         f"interpretation : {MIN_WORDS}-{MAX_WORDS} words",
         f"max seq len    : {MAX_SEQ_LEN} tokens (drop, never truncate)",
         "",

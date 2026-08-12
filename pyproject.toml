@@ -16,6 +16,13 @@ dependencies = [
     "pandas>=2.0",
     "scipy>=1.11",
     "matplotlib>=3.7",
+    # GroupKFold for the author-grouped partition. No reason to hand-roll a
+    # maintained implementation of the same greedy heuristic.
+    "scikit-learn>=1.3",
+    # Needed locally, not only for training: the funnel's token-budget filter
+    # must measure with the real tokeniser rather than estimate. AutoTokenizer
+    # works without torch, so this stays light.
+    "transformers>=4.44",
 ]
 
 [project.optional-dependencies]
