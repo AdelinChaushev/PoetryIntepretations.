@@ -1,0 +1,61 @@
+{
+  "created_utc": "2026-08-14T11:41:29+00:00",
+  "git": {
+    "commit": "1012fe9e15c279831ccd46da46fe56d5a77d4a04",
+    "branch": "main",
+    "dirty": true
+  },
+  "environment": {
+    "python": "3.13.9",
+    "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+    "packages": {
+      "transformers": "5.15.0",
+      "scikit-learn": "1.7.2",
+      "numpy": "2.3.5",
+      "pandas": "2.3.3",
+      "openai": "2.53.0"
+    }
+  },
+  "settings": {
+    "SEED": 42,
+    "MODEL": "Qwen/Qwen2.5-0.5B",
+    "TEACHER_MODEL": "deepseek-chat",
+    "MIN_LINES": 8,
+    "MAX_SEQ_LEN": 2048,
+    "MAX_POEM_TOKENS": 1632,
+    "MIN_WORDS": 80,
+    "MAX_WORDS": 250,
+    "N_FOLDS": 5,
+    "FOLD_GROUP_KEY": "author",
+    "EVAL_PER_FOLD": 30,
+    "N_FEWSHOT": 3,
+    "GENERATE_MAX_ATTEMPTS": 3,
+    "GENERATE_MAX_TOTAL_ATTEMPTS": 9,
+    "NEAR_DUPLICATE_THRESHOLD": 0.9,
+    "NUMBERED_LINE_THRESHOLD": 0.8,
+    "JUDGE_TEMPERATURE": 0.0,
+    "JUDGE_SCORE_MIN": 1,
+    "JUDGE_SCORE_MAX": 10,
+    "MIN_JUDGE_SEPARATION": 1.0
+  },
+  "artifacts": {
+    "RAW_POEMS_PATH": {
+      "present": true,
+      "sha256": "3a4c8e941de091c63426dbca1f8342a6ae9a3a51031ff1190c7dcc06a33b3a35",
+      "bytes": 13353443,
+      "lines": 3156
+    },
+    "INTERPRETATIONS_PATH": {
+      "present": true,
+      "sha256": "573c4b579d0fb1e2ef4d3ff73a5d7040faf167d85943dd475779a5f9e33aaa4c",
+      "bytes": 3788264,
+      "lines": 2778
+    },
+    "FOLD_ASSIGNMENT_PATH": {
+      "present": true,
+      "sha256": "b30702f7141ee89c3e7d442c9a9239277ba39220e2ce0b8ab640122c3fe95c75",
+      "bytes": 38687,
+      "lines": 2646
+    }
+  }
+}

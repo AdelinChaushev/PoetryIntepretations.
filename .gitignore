@@ -5,12 +5,28 @@
 !.env.example
 *.key
 
-# Data: the corpus is regenerable from PoetryDB and too large to track.
-# data/sample/ is the exception — a few committed examples so notebooks and
-# tests have something to run against without a full fetch.
+# Data. Two of these are COMMITTED, and the distinction is reproducibility.
+#
+# interpretations.jsonl (3.6 MB) is irreplaceable. It is 2,552 paid teacher
+# calls at temperature 0.3-0.5, so re-running produces DIFFERENT TEXT and a
+# different corpus. Without it in the repo nobody — including us after a disk
+# failure — could verify or rebuild a single reported number.
+#
+# raw_poems.jsonl (13 MB) is re-fetchable, but committing it pins exactly what
+# PoetryDB served on the day. The API is a live service with no versioning; a
+# poem edited upstream would silently change the corpus under a future reader.
+#
+# Backups and scratch copies are NOT committed: they are snapshots of moments
+# nothing references, and shipping several near-identical corpora invites the
+# wrong one being read.
 data/*
 !data/sample/
 !data/sample/**
+!data/interpretations.jsonl
+!data/raw_poems.jsonl
+!data/folds.json
+data/*.bak
+data/*.pre-retry.*
 
 # results/ IS committed — runs.csv, figures and the LoRA adapters are part of
 # the deliverable. Only transient checkpoints are excluded.

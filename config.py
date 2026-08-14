@@ -79,6 +79,15 @@ EVAL_POEMS_PATH: Path = DATA_DIR / "eval_poems.jsonl"
 
 RUNS_CSV_PATH: Path = RESULTS_DIR / "runs.csv"
 PRIOR_WORK_CSV_PATH: Path = RESULTS_DIR / "prior_work_comparison.csv"
+
+#: One row per judge from the swap test. Generated, never hand-typed, so the
+#: reported numbers cannot drift from the raw scores they came from.
+SWAP_SUMMARY_CSV_PATH: Path = RESULTS_DIR / "swap_test_summary.csv"
+
+#: Checksums, git commit, package versions and the settings a result was
+#: produced under. Committed with the results so a reader can verify the data
+#: analysed is the data shipped, rather than having to take it on trust.
+MANIFEST_PATH: Path = RESULTS_DIR / "manifest.json"
 ARM_OUTPUTS_PATH: Path = RESULTS_DIR / "arm_outputs.json"
 ADAPTERS_DIR: Path = RESULTS_DIR / "adapters"
 FIGURES_DIR: Path = RESULTS_DIR / "figures"
@@ -135,7 +144,19 @@ PRIMARY_JUDGE = JudgeSpec("gpt4o_mini", "gpt-4o-mini", "OPENAI_API_KEY")
 #: A different family from the teacher (DeepSeek), the student (Qwen) and the
 #: primary judge (OpenAI), so agreement between the two is evidence about the
 #: measurement rather than about shared lineage.
-SECONDARY_JUDGE = JudgeSpec("gemini_flash", "gemini-2.5-flash", "GOOGLE_API_KEY")
+#: DEVIATION FROM PRE-REGISTRATION, recorded rather than quietly applied. The
+#: pre-registered secondary was `gemini-2.5-flash`, which the API still lists
+#: but refuses to new keys with "no longer available to new users". Substituted
+#: with the nearest available pinned Flash model.
+#:
+#: Pinned, never `gemini-flash-latest`: an alias that moves under the project
+#: would change the instrument partway through a run and make scores from
+#: different days incomparable.
+#:
+#: This touches no headline number — the secondary judge answers exactly one
+#: question, "does the conclusion flip?", and every hypothesis test is computed
+#: from the primary alone.
+SECONDARY_JUDGE = JudgeSpec("gemini_flash", "gemini-3.5-flash", "GOOGLE_API_KEY")
 
 JUDGES: tuple[JudgeSpec, ...] = (PRIMARY_JUDGE, SECONDARY_JUDGE)
 
@@ -570,6 +591,76 @@ JUDGE_BOTH_ORDERINGS: bool = True
 JUDGE_TEMPERATURE: float = 0.0
 JUDGE_MAX_RETRIES: int = 3
 
+#: First backoff step, doubling per attempt. Rate limits are the expected
+#: failure on a free tier, and a 450-call run that aborts halfway has still
+#: spent the calls it made — so waiting is cheaper than restarting.
+JUDGE_BACKOFF_SECONDS: float = 2.0
+
+#: Minimum matched-minus-mismatched_random gap for a judge to be usable at all.
+#: Checked on TEACHER outputs, where grounding is known, so a judge failing it
+#: is failing on the easy case. Stated as an effect size rather than a p-value:
+#: with 150 paired observations almost any non-zero gap is significant, and the
+#: question is whether the instrument discriminates USEFULLY. One point on a
+#: ten-point scale is the least that could be called separation.
+MIN_JUDGE_SEPARATION: float = 1.0
+
+#: Seconds between judge calls. Judge runs are thousands of requests against a
+#: paid API; a small delay keeps well inside rate limits and costs minutes.
+JUDGE_DELAY_SECONDS: float = 0.1
+
+#: Scoring range the judge is asked for. Fixed here because the swap test is a
+#: DIFFERENCE between conditions, so the scale only has to be consistent, never
+#: calibrated — judge miscalibration affects matched and mismatched equally and
+#: cancels. That is what lets this work without ground truth.
+#: Generous, and it has to be. The reply is one integer, but current Gemini
+#: Flash models reason before answering and their thinking tokens come out of
+#: this budget: at 8 tokens they returned an EMPTY string, having spent the
+#: whole allowance thinking. That failure is silent — an empty reply parses to
+#: None and the pair is recorded as unscored, so a too-small budget would look
+#: like a judge that refuses to answer rather than like a misconfiguration.
+#:
+#: Runaway prose is guarded by the PARSER, not by this cap. `parse_score`
+#: anchors its match at the start of the reply, so a judge that writes an essay
+#: yields None instead of having a stray number read as its verdict.
+JUDGE_MAX_TOKENS: int = 512
+
+JUDGE_SCORE_MIN: int = 1
+JUDGE_SCORE_MAX: int = 10
+
+#: The swap-test prompt. ONE fixed template, never changed mid-run: a mixture of
+#: two prompts would make matched and mismatched scores incomparable, which is
+#: the only thing the measurement depends on.
+#:
+#: It asks about GROUNDING, not quality. A judge asked "is this a good
+#: interpretation?" would reward fluent, well-argued text regardless of which
+#: poem it was written for — which is precisely the failure this project exists
+#: to detect, reproduced inside its own instrument.
+SWAP_JUDGE_PROMPT_TEMPLATE: str = """\
+You are checking whether an interpretation was written about one specific poem.
+
+POEM
+"{title}" by {author}
+
+{poem}
+
+INTERPRETATION
+{interpretation}
+
+Score from {min_score} to {max_score} how specifically this interpretation \
+describes THIS poem:
+
+{min_score}-2  describes a different poem; its claims do not fit this text
+3-4  generic; would fit many poems equally well
+5-6  broadly consistent, but little that is specific to this poem
+7-8  clearly about this poem: its imagery, argument or movement
+9-{max_score}  unmistakably this poem; specific detail that fits nothing else
+
+Do NOT judge whether the interpretation is well written, insightful or \
+well argued. A fluent, elegant interpretation of the WRONG poem scores low.
+
+Reply with a single integer from {min_score} to {max_score} and nothing else.\
+"""
+
 #: Both judges score everything: the swap test, the pairwise win rates, and the
 #: day-2 validation on teacher outputs. Roughly 6,900 calls in total. Judge
 #: outputs are keyed by judge name so the two are never silently pooled.
@@ -595,15 +686,19 @@ SWAP_CONDITIONS: tuple[str, ...] = (
     "mismatched_same_author",
 )
 
-#: ``mismatched_random`` must draw from a DIFFERENT Act, or it would sometimes
-#: coincide with the same-Act condition and blur the two.
+#: ``mismatched_random`` must draw from a DIFFERENT AUTHOR, or it would
+#: sometimes coincide with the same-author condition and blur the two — the
+#: standard and strict controls would then converge for a reason that has
+#: nothing to do with the model.
 MISMATCH_REQUIRES_DIFFERENT_AUTHOR: bool = True
 
-#: Evaluation sections are sampled only from Acts with at least this many
-#: sections in the corpus, so a same-Act sibling always exists and all three
-#: conditions are computable for every evaluation section. Complete coverage
-#: keeps the paired bootstrap clean; the cost is an evaluation set biased
-#: toward longer Acts, which must be stated in limitations.
+#: Evaluation poems are sampled only from authors holding at least this many
+#: poems in the corpus, so a same-author sibling always exists and all three
+#: conditions are computable for every evaluation poem. Complete coverage keeps
+#: the paired bootstrap clean; the cost is an evaluation set biased toward
+#: prolific, heavily-anthologised poets, which must be stated in limitations —
+#: and that is also where author-prior leakage is strongest, so the bias runs
+#: against this project's own conclusions rather than in their favour.
 MIN_POEMS_PER_AUTHOR_FOR_EVAL: int = 2
 
 # --- Contamination probe -----------------------------------------------------

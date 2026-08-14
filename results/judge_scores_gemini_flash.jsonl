@@ -1,0 +1,12 @@
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 33, "shown_id": 33, "condition": "matched", "score": 9, "reply": "9-10: \"unmistakably this poem; specific detail that fits nothing else\". Since"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 33, "shown_id": 2097, "condition": "mismatched_random", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 33, "shown_id": 12, "condition": "mismatched_same_author", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 63, "shown_id": 63, "condition": "matched", "score": 10, "reply": "10"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 63, "shown_id": 2513, "condition": "mismatched_random", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 63, "shown_id": 32, "condition": "mismatched_same_author", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 296, "shown_id": 296, "condition": "matched", "score": null, "reply": "Is it generic? No.\n    *   Is it broadly consistent but lacking"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 296, "shown_id": 314, "condition": "mismatched_random", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 296, "shown_id": 262, "condition": "mismatched_same_author", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 332, "shown_id": 332, "condition": "matched", "score": 10, "reply": "10"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 332, "shown_id": 1612, "condition": "mismatched_random", "score": 1, "reply": "1"}
+{"judge": "gemini_flash", "judge_model": "gemini-3.5-flash", "arm": "teacher", "poem_id": 332, "shown_id": 325, "condition": "mismatched_same_author", "score": 1, "reply": "1"}
