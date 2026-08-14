@@ -129,6 +129,17 @@ class JudgeSpec(NamedTuple):
     model: str
     api_key_env: str
     base_url: str | None = None
+    #: Reasoning budget, sent as ``reasoning_effort`` when set and omitted
+    #: otherwise. ``None`` means the provider default and is required for models
+    #: that reject the parameter — GPT-4o-mini is not a reasoning model and
+    #: errors if it is sent.
+    #:
+    #: ``"none"`` matters for cost and for reliability, not for speed. A
+    #: reasoning judge spends hundreds of invisible output tokens deliberating
+    #: before it emits one digit, and those are billed; it also overruns its
+    #: token budget mid-thought on the hardest pairs, which is where every
+    #: unparseable reply in this project came from.
+    reasoning: str | None = None
 
 
 #: Pre-registered PRIMARY judge. Every hypothesis test (H1-H4) and every headline
@@ -156,7 +167,8 @@ PRIMARY_JUDGE = JudgeSpec("gpt4o_mini", "gpt-4o-mini", "OPENAI_API_KEY")
 #: This touches no headline number — the secondary judge answers exactly one
 #: question, "does the conclusion flip?", and every hypothesis test is computed
 #: from the primary alone.
-SECONDARY_JUDGE = JudgeSpec("gemini_flash", "gemini-3.5-flash", "GOOGLE_API_KEY")
+SECONDARY_JUDGE = JudgeSpec("gemini_flash", "gemini-3.5-flash", "GOOGLE_API_KEY",
+                            reasoning="none")
 
 JUDGES: tuple[JudgeSpec, ...] = (PRIMARY_JUDGE, SECONDARY_JUDGE)
 

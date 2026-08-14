@@ -23,6 +23,7 @@ this work without ground truth.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import re
@@ -125,6 +126,10 @@ def score_pair(pair, poem: dict, judge: config.JudgeSpec) -> dict:
     prompt = build_prompt(pair.interpretation, poem)
     last_error: Exception | None = None
 
+    # Sent only when set: GPT-4o-mini is not a reasoning model and rejects the
+    # parameter outright, so it cannot be passed unconditionally.
+    extra = {"reasoning_effort": judge.reasoning} if judge.reasoning else {}
+
     for attempt in range(config.JUDGE_MAX_RETRIES):
         try:
             response = get_client(judge).chat.completions.create(
@@ -132,6 +137,7 @@ def score_pair(pair, poem: dict, judge: config.JudgeSpec) -> dict:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=config.JUDGE_TEMPERATURE,
                 max_tokens=config.JUDGE_MAX_TOKENS,
+                **extra,
             )
             break
         except Exception as error:  # noqa: BLE001 - re-raised below
@@ -146,9 +152,16 @@ def score_pair(pair, poem: dict, judge: config.JudgeSpec) -> dict:
         raise last_error
 
     reply = (response.choices[0].message.content or "").strip()
+    usage = getattr(response, "usage", None)
     return {
         "judge": judge.name,
         "judge_model": judge.model,
+        # The reasoning setting is part of the instrument, not a runtime detail:
+        # the same model deliberating and not deliberating are two configurations
+        # whose scores must not be silently merged.
+        "reasoning": judge.reasoning or "default",
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
         "arm": pair.arm,
         "poem_id": pair.poem_id,
         "shown_id": pair.shown_id,
@@ -158,11 +171,19 @@ def score_pair(pair, poem: dict, judge: config.JudgeSpec) -> dict:
     }
 
 
-def _key(record) -> tuple:
-    """What makes a scored pair unique within one judge's cache."""
+def _key(record, reasoning: str | None = None) -> tuple:
+    """What makes a scored pair unique within one judge's cache.
+
+    Includes the reasoning setting, so the same model scored with and without
+    deliberation occupies two entries rather than one overwriting the other.
+    Records written before the setting existed default to ``"default"``, which
+    is what they were.
+    """
     if isinstance(record, dict):
-        return (record["arm"], record["poem_id"], record["condition"])
-    return (record.arm, record.poem_id, record.condition)
+        return (record["arm"], record["poem_id"], record["condition"],
+                record.get("reasoning", "default"))
+    return (record.arm, record.poem_id, record.condition,
+            reasoning or "default")
 
 
 def load_cached(judge: config.JudgeSpec) -> list[dict]:
@@ -204,9 +225,10 @@ def score_all(pairs, poems: list[dict], judge: config.JudgeSpec,
     config.require_api_key(judge.api_key_env)
     by_id = {poem["poem_id"]: poem for poem in poems}
 
+    setting = judge.reasoning or "default"
     done = {_key(record) for record in load_cached(judge)
             if record.get("score") is not None}
-    pending = [pair for pair in pairs if _key(pair) not in done]
+    pending = [pair for pair in pairs if _key(pair, setting) not in done]
     if limit is not None:
         pending = pending[:max(0, limit - (len(pairs) - len(pending)))]
 
@@ -214,23 +236,37 @@ def score_all(pairs, poems: list[dict], judge: config.JudgeSpec,
              len(pairs) - len(pending), len(pending))
 
     failures = 0
+    consecutive = 0
     progress = _progress(pending, judge)
-    for index, pair in enumerate(pending, start=1):
+    for pair in pending:
         try:
             record = score_pair(pair, by_id[pair.shown_id], judge)
         except Exception as error:  # noqa: BLE001 - one bad call must not stop the run
             failures += 1
-            _write(progress, f"failed {pair.poem_id}/{pair.condition}: {error}")
-            # Consecutive failures from the first call mean something systemic —
-            # a bad key, a billing limit, an outage — not bad luck on one pair.
-            if failures >= config.GENERATE_MAX_CONSECUTIVE_FAILURES and \
-                    failures == index:
+            consecutive += 1
+            _write(progress,
+                   f"failed {pair.poem_id}/{pair.condition}: "
+                   f"{type(error).__name__}: {str(error)[:110]}")
+
+            # A run of failures means something systemic — a spent quota, an
+            # expired key, an outage — not bad luck on individual pairs. This
+            # counts CONSECUTIVE failures rather than failures-since-the-start:
+            # a daily quota exhausted midway through leaves earlier successes
+            # behind it, so the old check never fired and the run ground
+            # through every remaining pair to report the same error each time.
+            if consecutive >= config.GENERATE_MAX_CONSECUTIVE_FAILURES:
+                if progress is not None:
+                    progress.close()
                 raise RuntimeError(
-                    f"aborting: the first {failures} {judge.name} calls all "
-                    f"failed, which points at a systemic problem. Progress so "
-                    f"far is cached."
+                    f"aborting after {consecutive} consecutive {judge.name} "
+                    f"failures — this is systemic, not per-pair. "
+                    f"{len(pairs) - len(pending) + failures - consecutive} "
+                    f"scores are cached and will be skipped on the next run.\n"
+                    f"last error: {str(error)[:200]}"
                 ) from error
             continue
+
+        consecutive = 0
 
         _append(judge, record)
         if progress is not None:
@@ -243,7 +279,7 @@ def score_all(pairs, poems: list[dict], judge: config.JudgeSpec,
         log.warning("%s: %d pairs failed and were skipped; re-run to retry",
                     judge.name, failures)
 
-    wanted = {_key(pair) for pair in pairs}
+    wanted = {_key(pair, setting) for pair in pairs}
     return [record for record in load_cached(judge) if _key(record) in wanted]
 
 
@@ -278,6 +314,16 @@ def assert_single_judge(records: list[dict]) -> str:
     assert len(names) == 1, (
         f"records span {sorted(names)} — judges are never pooled. Filter to one "
         f"judge and report the second alongside, never averaged into it."
+    )
+    # The reasoning setting is part of the instrument for the same reason the
+    # model name is. A mean over a deliberating and a non-deliberating judge is
+    # a composite of two measurements wearing one name.
+    settings = {record.get("reasoning", "default") for record in records}
+    assert len(settings) == 1, (
+        f"records span reasoning settings {sorted(settings)} — the same model "
+        f"deliberating and not deliberating are two configurations, and mixing "
+        f"them averages two instruments. Filter to one and report the other "
+        f"beside it."
     )
     return names.pop()
 
@@ -409,3 +455,92 @@ def separation_verdict(records: list[dict]) -> tuple[bool, str]:
         f"cannot measure the arms either. The design must change."
     )
     return passed, verdict
+
+
+def score_spread(records: list[dict]) -> dict:
+    """Per-condition range and value counts for one judge.
+
+    Means hide saturation. A condition whose scores are all the identical value
+    has zero variance, and any gap computed from it is a floor or ceiling
+    effect rather than a measurement — the number could not have come out
+    otherwise. That is invisible in a mean and obvious here.
+    """
+    assert_single_judge(records)
+    spread: dict = {}
+    for condition in config.SWAP_CONDITIONS:
+        values = [record["score"] for record in records
+                  if record["condition"] == condition
+                  and record.get("score") is not None]
+        if not values:
+            continue
+        counts = collections.Counter(values)
+        spread[condition] = {
+            "n": len(values),
+            "min": min(values),
+            "max": max(values),
+            "distinct": len(counts),
+            "saturated": len(counts) == 1,
+            "counts": dict(sorted(counts.items())),
+        }
+    return spread
+
+
+def saturated_conditions(records: list[dict]) -> list[str]:
+    """Conditions where this judge returned a single value for every pair.
+
+    Named separately because the consequence is easy to misread. A saturated
+    control makes the author component structurally zero, and reporting that as
+    "no author effect was found" states a property of the scale as though it
+    were a property of the model.
+    """
+    return [condition for condition, stats in score_spread(records).items()
+            if stats["saturated"]]
+
+
+def inter_judge_agreement(first: list[dict], second: list[dict],
+                          threshold: int | None = None) -> dict:
+    """Compare two judges on the pairs both scored.
+
+    This is the one place two judges legitimately meet, and they still are not
+    pooled: the scores stay in separate arguments and separate columns, and
+    what is returned is agreement BETWEEN them rather than an average OF them.
+
+    Reports raw agreement and Cohen's kappa. Raw agreement alone is inflated
+    when one verdict dominates — and here it does, since most controls sit at
+    the floor, so two judges agreeing by both saying "1" is barely evidence.
+    Kappa discounts exactly that chance agreement, which is why Zheng et al.
+    style comparisons need it rather than the raw number.
+
+    **Kappa comes back NaN when neither judge varies**, and that is the correct
+    answer rather than a bug or a zero. With no variance there is no chance
+    agreement to correct for, so the statistic is undefined — and a NaN here is
+    itself the finding: it says the two judges agree completely on a question
+    neither of them was able to answer in more than one way.
+    """
+    from sklearn.metrics import cohen_kappa_score
+
+    name_a, name_b = assert_single_judge(first), assert_single_judge(second)
+    if threshold is None:
+        threshold = (config.JUDGE_SCORE_MIN + config.JUDGE_SCORE_MAX) / 2
+
+    left = {(r["arm"], r["poem_id"], r["condition"]): r["score"]
+            for r in first if r.get("score") is not None}
+    right = {(r["arm"], r["poem_id"], r["condition"]): r["score"]
+             for r in second if r.get("score") is not None}
+    shared = sorted(left.keys() & right.keys())
+    if not shared:
+        return {"judges": (name_a, name_b), "n": 0}
+
+    a = [left[key] for key in shared]
+    b = [right[key] for key in shared]
+    a_side = [score >= threshold for score in a]
+    b_side = [score >= threshold for score in b]
+
+    return {
+        "judges": (name_a, name_b),
+        "n": len(shared),
+        "exact_agreement": sum(x == y for x, y in zip(a, b)) / len(shared),
+        "same_side": sum(x == y for x, y in zip(a_side, b_side)) / len(shared),
+        "cohens_kappa": float(cohen_kappa_score(a_side, b_side)),
+        "mean_difference": sum(x - y for x, y in zip(a, b)) / len(shared),
+    }

@@ -1,0 +1,3 @@
+judge,judge_model,arm,n_pairs,n_scored,n_unparseable,mean_matched,mean_mismatched_random,mean_mismatched_same_author,grounding_gap,poem_level_gap,author_component,n_paired_poems
+gpt4o_mini,gpt-4o-mini,teacher,450,450,0,8.967,1.067,1.167,7.9,7.8,0.1,150
+gemini_flash,gemini-3.5-flash,teacher,450,450,0,9.993,1.0,1.013,8.993,8.98,0.013,150

@@ -136,3 +136,33 @@ def test_check_all_rejects_a_control_showing_its_own_poem():
     except AssertionError:
         return
     raise AssertionError("a control showing its own poem was not caught")
+
+
+# --- the quote-leakage ablation ----------------------------------------------
+
+def test_stripping_quotes_removes_the_quoted_spans():
+    from src.eval import grounding
+
+    text = 'It turns on "the snow sleeps on my skin", a startling image.'
+    stripped = grounding.remove_quotes(text)
+    assert "snow sleeps" not in stripped
+    assert "a startling image" in stripped
+
+
+def test_stripped_pairs_get_their_own_arm_name():
+    """Otherwise the ablation would overwrite the real scores in the cache, and
+    the comparison it exists for would be impossible."""
+    quoted = swap_test.build_pairs([interpretation(1)], CORPUS)
+    stripped = swap_test.build_pairs([interpretation(1)], CORPUS,
+                                     strip_quotes=True)
+    assert quoted[0].arm == "teacher"
+    assert stripped[0].arm == "teacher_noquotes"
+
+
+def test_stripping_does_not_change_which_poems_are_drawn():
+    """The ablation must differ from the real run in ONE respect only, or the
+    comparison confounds quote removal with a different draw."""
+    quoted = swap_test.build_pairs([interpretation(1)], CORPUS)
+    stripped = swap_test.build_pairs([interpretation(1)], CORPUS,
+                                     strip_quotes=True)
+    assert [p.shown_id for p in quoted] == [p.shown_id for p in stripped]

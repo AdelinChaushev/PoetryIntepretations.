@@ -169,3 +169,24 @@ def grounding_rate(pairs: list[tuple[str, dict]]) -> float:
     if not pairs:
         return 0.0
     return sum(check(text, poem)["grounded"] for text, poem in pairs) / len(pairs)
+
+
+def remove_quotes(interpretation: str, placeholder: str = "[quotation removed]") -> str:
+    """Strip quoted spans, leaving the interpreter's own prose.
+
+    Exists for one ablation, and it is the ablation that decides whether an LLM
+    judge is worth its cost here. The output schema asks for exact quotations,
+    so a matched pair contains literal substrings of the poem shown and a
+    mismatched pair contains none. A judge could therefore separate the two
+    perfectly by string matching alone — which :func:`check` already does for
+    free — and the score would look like reading while measuring nothing the
+    judge is needed for.
+
+    Removing the quotes removes that shortcut. Whatever separation survives is
+    the judge responding to the interpretation's *claims* about the poem, which
+    is the thing being paid for.
+
+    A placeholder is left rather than deleting silently, so the prose does not
+    close over the gap and read as though nothing was ever there.
+    """
+    return _QUOTED.sub(placeholder, interpretation)

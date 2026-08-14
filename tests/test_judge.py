@@ -214,3 +214,120 @@ def test_gate_fails_when_matched_and_mismatched_score_alike():
     from ungrounded on text known to be grounded."""
     passed, message = judge.separation_verdict(scored(1, 6, 6, 6))
     assert not passed and "design must change" in message
+
+
+def test_abort_counts_consecutive_failures_not_failures_since_start():
+    """A daily quota exhausted midway leaves successes behind it. Counting
+    failures-since-the-start never fires then, and the run grinds through every
+    remaining pair to report the same error each time."""
+    import inspect
+    source = inspect.getsource(judge.score_all)
+    assert "consecutive" in source
+    assert "failures == index" not in source
+
+
+# --- saturation and agreement -------------------------------------------------
+
+def test_saturated_condition_is_flagged():
+    """A control where every pair scored the same value makes the author
+    component structurally zero — a property of the scale, not the model."""
+    flat = [record(poem_id=i, condition="mismatched_random", score=1)
+            for i in range(5)]
+    assert "mismatched_random" in judge.saturated_conditions(flat)
+
+
+def test_varied_condition_is_not_flagged():
+    varied = [record(poem_id=i, condition="mismatched_random", score=s)
+              for i, s in enumerate([1, 1, 2, 3])]
+    assert judge.saturated_conditions(varied) == []
+
+
+def test_spread_reports_range_and_counts():
+    recs = [record(poem_id=i, condition="matched", score=s)
+            for i, s in enumerate([8, 9, 9, 10])]
+    stats = judge.score_spread(recs)["matched"]
+    assert (stats["min"], stats["max"], stats["distinct"]) == (8, 10, 3)
+    assert stats["counts"] == {8: 1, 9: 2, 10: 1}
+
+
+def test_agreement_needs_both_judges_separately():
+    """The two judges meet here and are still not pooled: separate arguments,
+    separate columns, agreement BETWEEN rather than an average OF."""
+    a = scored(1, 9, 1, 1) + scored(2, 8, 2, 1)
+    b = scored(1, 10, 1, 1, name="gemini_flash") + \
+        scored(2, 9, 1, 1, name="gemini_flash")
+    result = judge.inter_judge_agreement(a, b)
+    assert result["judges"] == ("gpt4o_mini", "gemini_flash")
+    assert result["n"] == 6
+    assert result["same_side"] == 1.0
+
+
+def test_kappa_is_undefined_when_neither_judge_varies():
+    """Perfect raw agreement on a constant is not evidence of agreement. With no
+    variance there is no chance agreement to correct for, so kappa is undefined
+    — and the NaN is the finding: both judges agree completely on a question
+    neither could answer in more than one way."""
+    import math
+
+    a = [record(poem_id=i, condition="mismatched_random", score=1)
+         for i in range(20)]
+    b = [record(poem_id=i, condition="mismatched_random", score=1,
+                judge="gemini_flash") for i in range(20)]
+    result = judge.inter_judge_agreement(a, b)
+    assert result["same_side"] == 1.0
+    assert math.isnan(result["cohens_kappa"])
+
+
+def test_kappa_is_defined_when_judges_vary():
+    a = [record(poem_id=i, condition="matched", score=s)
+         for i, s in enumerate([9, 9, 1, 1, 9, 1])]
+    b = [record(poem_id=i, condition="matched", score=s, judge="gemini_flash")
+         for i, s in enumerate([9, 1, 1, 1, 9, 9])]
+    result = judge.inter_judge_agreement(a, b)
+    assert 0.0 < result["cohens_kappa"] < 1.0
+
+
+# --- reasoning is part of the instrument --------------------------------------
+
+def test_reasoning_setting_keys_the_cache():
+    """The same model deliberating and not deliberating must occupy two cache
+    entries, or rescoring silently overwrites the comparison it exists for."""
+    pair = swap_test.Pair(1, 1, "matched", "text", "teacher")
+    assert judge._key(pair, "default") != judge._key(pair, "none")
+
+
+def test_untagged_records_key_as_default():
+    """Records written before the setting existed were the provider default,
+    which is what they must continue to key as."""
+    legacy = record()
+    legacy.pop("reasoning", None)
+    pair = swap_test.Pair(1, 1, "matched", "text", "teacher")
+    assert judge._key(legacy) == judge._key(pair, "default")
+
+
+def test_aggregation_refuses_to_mix_reasoning_settings():
+    """A mean over a deliberating and a non-deliberating judge is a composite of
+    two instruments wearing one name."""
+    thinking = [record(poem_id=1, reasoning="default")]
+    quiet = [record(poem_id=2, reasoning="none")]
+    try:
+        judge.assert_single_judge(thinking + quiet)
+    except AssertionError:
+        return
+    raise AssertionError("two reasoning settings were pooled")
+
+
+def test_same_setting_aggregates_normally():
+    same = [record(poem_id=1, reasoning="none"),
+            record(poem_id=2, reasoning="none")]
+    assert judge.assert_single_judge(same) == "gpt4o_mini"
+
+
+def test_primary_judge_sends_no_reasoning_parameter():
+    """GPT-4o-mini is not a reasoning model and errors if the parameter is
+    sent, so it must stay unset rather than be given a neutral value."""
+    assert config.PRIMARY_JUDGE.reasoning is None
+
+
+def test_secondary_judge_has_reasoning_disabled():
+    assert config.SECONDARY_JUDGE.reasoning == "none"

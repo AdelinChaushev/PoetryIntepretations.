@@ -69,6 +69,7 @@ def build_pairs(
     arm: str = "teacher",
     seed: int | None = None,
     near_duplicates: dict | None = None,
+    strip_quotes: bool = False,
 ) -> list[Pair]:
     """Construct all three conditions for every interpretation.
 
@@ -79,6 +80,14 @@ def build_pairs(
         seed: drawn deterministically so the same pairs are scored on every
             run — a judge call is paid for, and re-running with different
             controls would make two partial runs incomparable.
+        strip_quotes: replace quoted spans with a placeholder, and suffix the
+            arm name with ``_noquotes`` so the two never share a cache entry.
+            This is the ablation that decides whether the judge is doing
+            semantic work: the schema asks for exact quotations, so a matched
+            pair contains literal substrings of the poem shown and a mismatched
+            pair contains none — a judge could separate them by string matching
+            alone, which the free checker already does. Separation that
+            survives removal is the judge reading the interpretation's claims.
         near_duplicates: ``poem_id -> ids of same-author near-identical poems``,
             from :func:`src.data.filter.near_duplicate_ids`. Excluded from the
             same-author draw. Passing ``None`` disables the exclusion and is
@@ -92,6 +101,8 @@ def build_pairs(
         comparison and bias the gap toward whoever remained.
     """
     rng = random.Random(config.SEED if seed is None else seed)
+    if strip_quotes:
+        arm = f"{arm}_noquotes"
     by_id = {poem["poem_id"]: poem for poem in corpus}
     by_author = _by_author(corpus)
     authors = sorted(by_author)
@@ -121,6 +132,9 @@ def build_pairs(
         stranger = rng.choice(by_author[rng.choice(other_authors)])
 
         text = record["interpretation"]
+        if strip_quotes:
+            from src.eval.grounding import remove_quotes
+            text = remove_quotes(text)
         pairs.extend([
             Pair(poem["poem_id"], poem["poem_id"], "matched", text, arm),
             Pair(poem["poem_id"], stranger["poem_id"],
