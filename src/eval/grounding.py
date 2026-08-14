@@ -36,9 +36,51 @@ _EQUIVALENTS = {
     "—": "-", "―": "-", "−": "-",
     "…": "...", " ": " ",
 }
-_TRANSLATION = str.maketrans(_EQUIVALENTS)
+#: Ligatures do not decompose under NFKD, but a model writing "Caesar" where the
+#: poem prints "Cæsar" has quoted correctly — the difference is typographic, not
+#: lexical, exactly like the curly quotes above.
+_LIGATURES = {"æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ﬁ": "fi", "ﬂ": "fl"}
 
-_PUNCTUATION = re.compile(r"[^\w\s]")
+def _mojibake_table() -> dict[str, str]:
+    """Cyrillic letters back to the Latin-1 letters they were mis-decoded from.
+
+    Some PoetryDB records arrive with accented bytes read as CP1251 rather than
+    Latin-1, so ``Deservèd`` prints as ``Deservиd`` (byte 0xE8). Built by
+    round-tripping bytes rather than hand-listing pairs, so it cannot drift.
+    Both sides must be letters: 0xBE is a Cyrillic letter but ``¾`` in Latin-1,
+    and rewriting a word into a fraction sign is worse than leaving it.
+    """
+    table = {}
+    for byte in range(0x80, 0x100):
+        try:
+            cyrillic = bytes([byte]).decode("cp1251")
+            latin = bytes([byte]).decode("latin-1")
+        except UnicodeDecodeError:
+            continue
+        if (cyrillic != latin
+                and unicodedata.category(cyrillic).startswith("L")
+                and unicodedata.category(latin).startswith("L")):
+            table[cyrillic] = latin
+    return table
+
+
+#: Applied during normalisation, not only when cleaning the corpus. The teacher
+#: was shown the corrupt text, so it quoted ``stretchиd`` faithfully — repairing
+#: only the poem would break a quote that was correct against what the model
+#: actually saw. Folding both sides makes the check invariant to the corruption
+#: whichever side carries it.
+MOJIBAKE_TO_LATIN = _mojibake_table()
+
+_TRANSLATION = str.maketrans({**_EQUIVALENTS, **_LIGATURES, **MOJIBAKE_TO_LATIN})
+
+#: Punctuation, plus the underscore. ``\w`` counts ``_`` as a word character,
+#: so ``[^\w\s]`` alone leaves it in place — and PoetryDB marks emphasis with
+#: underscores (``like _hers_ and unlike _mine_``) in 6.7% of poems. A model
+#: quoting such a line correctly writes it without the markup, so leaving the
+#: underscores in fails the substring check on a quote that is verbatim right.
+#: That is a false ungrounded verdict, and it lands hardest on the emphatic
+#: lines a reader is most likely to quote.
+_PUNCTUATION = re.compile(r"[^\w\s]|_")
 _WHITESPACE = re.compile(r"\s+")
 
 #: Quoted spans: straight or curly double quotes, or curly singles. Straight
@@ -59,6 +101,12 @@ def normalise(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = text.translate(_TRANSLATION)
     text = text.lower()
+    # Fold diacritics. In this corpus the accent is usually metrical notation
+    # rather than spelling — "Deservèd" is scanned as two syllables, and
+    # Hopkins accents stressed syllables outright ("hére pérsonal") — so a
+    # model writing "deserved" has quoted the word, not a different one.
+    text = "".join(char for char in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(char))
     text = _PUNCTUATION.sub(" ", text)
     return _WHITESPACE.sub(" ", text).strip()
 

@@ -233,3 +233,47 @@ def test_poem_below_min_lines_is_rejected():
             "lines": ["a line"] * (config.MIN_LINES - 1),
             "linecount": config.MIN_LINES - 1}
     assert not data_filter.within_length_bounds(tiny)
+
+
+# --- near-duplicate detection -------------------------------------------------
+
+def poem(pid, author, title, lines):
+    return {"poem_id": pid, "author": author, "title": title,
+            "lines": lines, "linecount": len(lines)}
+
+
+SONNET = ["Now God be thanked who has matched us with his hour",
+          "And caught our youth and wakened us from sleeping",
+          "With hand made sure clear eye and sharpened power"]
+
+
+def test_same_text_under_two_titles_is_flagged():
+    """PoetryDB publishes Brooke's "The Soldier" under three titles, and
+    deduplication keys on title as well as text, so they survive it."""
+    found = data_filter.near_duplicate_ids([
+        poem(1, "Rupert Brooke", "The Soldier", SONNET),
+        poem(2, "Rupert Brooke", "1914 V: The Soldier", SONNET),
+    ])
+    assert found == {1: {2}, 2: {1}}
+
+
+def test_different_poems_by_one_author_are_not_flagged():
+    found = data_filter.near_duplicate_ids([
+        poem(1, "A", "x", SONNET),
+        poem(2, "A", "y", ["A slumber did my spirit seal",
+                           "I had no human fears she seemed",
+                           "A thing that could not feel the touch"]),
+    ])
+    assert found == {}
+
+
+def test_identical_text_by_different_authors_is_not_compared():
+    """Only same-author pairs are compared. Two poets writing near-identical
+    text does not occur here, and restricting keeps this out of O(n^2)."""
+    assert data_filter.near_duplicate_ids([
+        poem(1, "A", "x", SONNET), poem(2, "B", "y", SONNET),
+    ]) == {}
+
+
+def test_single_poem_corpus_is_safe():
+    assert data_filter.near_duplicate_ids([poem(1, "A", "x", SONNET)]) == {}

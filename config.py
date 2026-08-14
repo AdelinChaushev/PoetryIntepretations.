@@ -20,7 +20,9 @@ Two switches change what the values mean:
 
 from __future__ import annotations
 
+import logging
 import os
+import warnings
 from pathlib import Path
 from typing import NamedTuple
 
@@ -138,17 +140,45 @@ SECONDARY_JUDGE = JudgeSpec("gemini_flash", "gemini-2.5-flash", "GOOGLE_API_KEY"
 JUDGES: tuple[JudgeSpec, ...] = (PRIMARY_JUDGE, SECONDARY_JUDGE)
 
 
+#: Keys may also live in a `.env` file at the project root, which `.gitignore`
+#: excludes. This exists because a Jupyter server inherits its environment at
+#: launch and cannot pick up a later `export` — restarting the whole server to
+#: add one variable is friction that ends with someone pasting a key into a
+#: tracked file. Loading `.env` at import removes that temptation entirely.
+#: Real environment variables always win, so this never overrides a deliberate
+#: `export`, and Kaggle (which has no `.env`) is unaffected.
+ENV_FILE: Path = PROJECT_ROOT / ".env"
+
+
+def _load_dotenv() -> None:
+    """Load `.env` into the environment without overriding what is already set."""
+    if not ENV_FILE.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # pragma: no cover - optional convenience only
+        return
+    load_dotenv(ENV_FILE, override=False)
+
+
+_load_dotenv()
+
+
 def require_api_key(env_var: str) -> str:
     """Return an API key from the environment, or fail with a usable message.
 
-    Keys are never literals and never committed. They are only ever needed
-    locally — no key should be pasted into a Kaggle notebook.
+    Keys are never literals and never committed — they come from the shell
+    environment or from a gitignored `.env`. No key should ever be pasted into
+    a tracked file or a Kaggle notebook.
     """
     key = os.getenv(env_var)
     if not key:
         raise RuntimeError(
-            f"{env_var} is not set. Export it in your shell before running:\n"
-            f"    export {env_var}=..."
+            f"{env_var} is not set.\n"
+            f"Either export it in the shell that launched Jupyter:\n"
+            f"    export {env_var}=...\n"
+            f"or add it to {ENV_FILE} (gitignored), which needs no restart:\n"
+            f"    {env_var}=..."
         )
     return key
 
@@ -192,6 +222,14 @@ FETCH_TITLE_RETRIES: int = 2
 #: to a free service.
 FETCH_USER_AGENT: str = "poetry-grounding/0.1 (SoftUni course project)"
 
+#: Authors PoetryDB serves. A fixed anthology, not a growing one, so this is a
+#: property of the source rather than a target. Recorded because a partial
+#: fetch is otherwise silent: the two known failures — a 403 on an unset user
+#: agent and a 503 on the largest per-author collections — both end with fewer
+#: authors and no error, and everything downstream would simply run on a
+#: smaller corpus. Comparing against a known count makes that loud.
+POETRYDB_AUTHOR_COUNT: int = 129
+
 #: Pause between author requests. Not required by the API, but the whole
 #: anthology is 129 requests against a free service — there is no reason to
 #: hammer it.
@@ -212,10 +250,38 @@ SMOKE_MAX_AUTHORS: int = 2
 #: knowable until the teacher has run.
 N_POEMS: int | None = 20 if SMOKE else None
 
-#: Minimum poem length, in lines. The schema asks for two or three exact
-#: quotes; below 8 lines those quotes would be most of the poem, and the
-#: grounding check would stop distinguishing "read it" from "copied it out".
+#: Minimum poem length, in lines — DERIVED from the measured corpus, not
+#: chosen. The teacher emits 3.39 quoted spans per interpretation (the prompt
+#: asks for two or three), and the share of a poem that ends up inside quotes
+#: rises sharply as poems shorten:
+#:
+#:     8-9 lines   42% of the poem quoted (median)
+#:     10-12       31%
+#:     13-16       24%
+#:     25-39       14%
+#:     40+          7%
+#:
+#: Extrapolating below 8 lines, three quoted spans exceed half the poem and
+#: approach the whole text. At that point the grounding check stops measuring
+#: what it is for: an "interpretation" that reproduces the poem scores as
+#: perfectly grounded, so quoting becomes indistinguishable from reading.
+#:
+#: 8 is where the measured curve crosses roughly 40%. The floor cost 239 poems
+#: (2-7 lines), which is stated in limitations rather than passed over.
 MIN_LINES: int = 8
+
+#: Share of a poem's non-blank lines that must carry an ascending source line
+#: number before the numbering is stripped as an artefact. A handful of
+#: PoetryDB records arrive as ``"4 All skillful in the wars;"`` — the number is
+#: an editorial reference, not part of the poem. Left in place it corrupts two
+#: things at once: the model is trained on text containing line numbers, and a
+#: correctly-quoted couplet fails the grounding check because the number sits
+#: between the two lines.
+#:
+#: High, and paired with a monotonicity test, because the failure mode runs one
+#: way. Stripping a poem that genuinely opens lines with numerals would delete
+#: real words; leaving one unstripped costs a few false ungrounded verdicts.
+NUMBERED_LINE_THRESHOLD: float = 0.8
 
 #: There is deliberately NO maximum line count. An earlier version capped poems
 #: at 100 lines — a number chosen by argument rather than measurement. Measuring
@@ -230,6 +296,51 @@ MIN_LINES: int = 8
 #: be an interpretation; above the ceiling it is padded.
 MIN_WORDS: int = 80
 MAX_WORDS: int = 250
+
+#: Share of interpretations a single tone word may occupy before the tone slot
+#: is being filled from habit rather than from reading the poem. Not a filter —
+#: nothing is dropped for crossing it — but a threshold the EDA marks, because
+#: this failure is invisible to every other check: an interpretation can follow
+#: the schema, quote accurately, clear the funnel, and still say the same thing
+#: about every poem in the corpus. Set where a word is common enough to be
+#: unconditional rather than descriptive.
+TONE_DOMINANCE_WARN: float = 0.5
+
+#: Pairs sampled per condition when measuring how much author identity alone
+#: predicts similarity between poems. Every same-author pair is used where
+#: there are fewer than this; cross-author pairs are sampled to match, so the
+#: two distributions are compared at equal n rather than 3.2M against 2.5k.
+SIMILARITY_PAIRS: int = 4000
+
+#: TF-IDF cosine above which two poems by the same author are treated as the
+#: same text. PoetryDB publishes some poems under several titles — Brooke's
+#: "The Soldier" appears three times, Tennyson's In Memoriam sections twice —
+#: and deduplication keys on title as well as text, so these survive it.
+#:
+#: This threatens exactly one thing, and it is the central measurement: if the
+#: "different poem by the same author" drawn for the strict swap condition is
+#: actually the SAME poem under another title, that condition silently becomes
+#: the matched condition, and the poem-level gap collapses to zero for a reason
+#: that has nothing to do with the model. `swap_test` must exclude these.
+NEAR_DUPLICATE_THRESHOLD: float = 0.9
+
+#: Minimum poems an author needs to enter the authorship-attribution check.
+#: Below this the class is too small to hold out from, and accuracy would be
+#: dominated by classes with one or two examples rather than by real signal.
+MIN_POEMS_FOR_ATTRIBUTION: int = 20
+
+#: Label shuffles used for the attribution null. The reported p-value floors at
+#: 1/(N+1), so 30 permutations cannot report below p≈0.032 however strong the
+#: effect is — the null's *mean accuracy* is the informative output here, not
+#: the p-value. Raising this costs a full refit per permutation.
+N_PERMUTATIONS: int = 30
+
+#: Share held out of the attribution check and scored exactly once. K-fold
+#: already tests every poem on a model that never trained on it, but every poem
+#: is still seen during some fit, so no single number rests on wholly unseen
+#: data. This split does, and it is reported beside the cross-validated figure
+#: as a check that the two agree rather than as a replacement for it.
+HOLDOUT_FRACTION: float = 0.25
 
 #: Hard token ceiling for prompt + target combined, measured with the real
 #: tokeniser. A pair that exceeds it is DROPPED, never truncated: truncating
@@ -254,8 +365,40 @@ MAX_POEM_TOKENS: int = MAX_SEQ_LEN - PROMPT_OVERHEAD_TOKENS
 # Teacher generation
 # ---------------------------------------------------------------------------
 
+#: Poems in the day-1 pilot. Enough to estimate a hallucination rate with a
+#: usable interval, cheap enough that a bad prompt costs cents rather than the
+#: whole corpus. Generation is resumable, so the pilot is not wasted work.
+PILOT_SIZE: int = 30
+
+#: Pilot interpretations printed in full for reading. No metric answers
+#: "is this any good"; that requires looking.
+PILOT_SHOW: int = 2
+
 #: Low enough that the four-part schema is followed reliably, high enough that
 #: the interpretations are not all the same sentence.
+#: Attempts per poem before giving up. A hallucinated quote is a bad draw from
+#: the sampler, not a property of the poem — the same class of failure as a
+#: timeout, which is already retried. Discarding a usable poem over a
+#: recoverable output failure is the wasteful choice, and dropping is not
+#: neutral either: it removes long poems (7.5% above 40 lines vs 5.0% below 12)
+#: and Byron (14.7%) disproportionately, biasing the corpus toward poems the
+#: teacher found easy.
+#:
+#: This makes each target best-of-N rather than a single sample, which is
+#: ordinary rejection sampling — but it means the FIRST attempt's verdict must
+#: be recorded, because the reported teacher hallucination rate is a finding
+#: about the teacher, not about the corpus. Retry to save the poem, never to
+#: improve the number.
+GENERATE_MAX_ATTEMPTS: int = 3
+
+#: Ceiling on attempts accumulated ACROSS runs, for `retry_ungrounded=True`.
+#: `GENERATE_MAX_ATTEMPTS` is a per-run budget, so re-running would otherwise
+#: give the same poem three more calls indefinitely. Some poems are genuinely
+#: hard for the teacher to quote — dialect spelling, heavy elision, archaic
+#: orthography — and those should stop absorbing calls rather than be retried
+#: forever at the ~0.5% of the corpus where success is least likely.
+GENERATE_MAX_TOTAL_ATTEMPTS: int = 9
+
 #: Pause between teacher calls. ~2,500 requests against a paid API; a small
 #: delay keeps well inside rate limits and costs a few minutes overall.
 #: Abort generation if this many calls fail in a row from the start. Repeated
@@ -528,3 +671,69 @@ def summary() -> str:
 
 if __name__ == "__main__":
     print(summary())
+
+
+# ---------------------------------------------------------------------------
+# Notebook logging
+# ---------------------------------------------------------------------------
+
+#: Third-party loggers that bury this project's own output.
+#:
+#: Each entry is silenced for a stated reason, because a blanket "quieten
+#: everything" would also hide the failures worth seeing:
+#:
+#: ``httpx`` / ``httpcore`` / ``openai`` — one INFO line per request. Across a
+#: 2,600-call teacher run that is thousands of "200 OK" lines with the real
+#: failures buried inside them.
+#:
+#: ``huggingface_hub`` / ``filelock`` — the tokeniser is loaded from cache, but
+#: the hub still logs every HEAD request it makes to revalidate it. Nothing is
+#: downloaded and nothing is wrong.
+#:
+#: ``transformers`` — the parent, because the noise comes from several children
+#: (``import_utils`` announcing that PyTorch is absent, ``utils.hub`` narrating
+#: cache revalidation, ``tokenization_utils_base`` warning that a sequence
+#: exceeds the model maximum). That last one is *expected and deliberate*: the
+#: funnel tokenises every poem to measure it, including the 180,903-token
+#: outlier, and the point of measuring is to drop what does not fit — so the
+#: warning fires on exactly the poems the filter exists to catch.
+_NOISY_LOGGERS = (
+    "httpx", "httpcore", "openai", "urllib3",
+    "huggingface_hub", "filelock",
+    "transformers",
+)
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Set up logging for a notebook, and quieten the libraries that shout.
+
+    Called from the first cell of every notebook instead of ``basicConfig``, so
+    the four notebooks cannot drift into four different logging setups — and so
+    the reason each suppression is safe is written down once, next to the list,
+    rather than rediscovered per notebook.
+
+    ``force=True`` because Jupyter installs its own handler at kernel start; a
+    plain ``basicConfig`` is a no-op once one exists, which is why log lines
+    reappear after a restart when it is omitted.
+    """
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s",
+                        force=True)
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+    # The hub prints this via `warnings`, not logging, so a logger level does
+    # not reach it — and it prints on every load. Nothing here is rate-limited:
+    # the tokeniser is small and served from cache.
+    warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
+
+    # Progress bars render as control characters in a saved notebook, and the
+    # notebooks are committed with outputs preserved.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+
+# Read when transformers and huggingface_hub are first imported, which happens
+# lazily inside the funnel — long after this module loads. Set at import rather
+# than inside configure_logging() so a script that never calls it is quiet too.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")

@@ -18,38 +18,134 @@ exactly what the caching rule exists to prevent.
 from __future__ import annotations
 
 import collections
-import hashlib
 import json
 import logging
 import re
 import time
+import unicodedata
 from typing import Iterator
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import config
+from src.eval import grounding
 
 log = logging.getLogger(__name__)
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
+#: A leading editorial line number: ``"4 All skillful in the wars;"``. Requires
+#: whitespace then a non-space after the digits, so a line that merely opens
+#: with a numeral is not matched on that basis alone.
+_LINE_NUMBER = re.compile(r"^\s*(\d+)\s+(?=\S)")
+
+_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
+_WORD = re.compile(r"\S+")
 
 
-def _slug(text: str, max_length: int = 30) -> str:
-    """Lowercase, hyphen-separated form of ``text``, truncated."""
-    return _SLUG_RE.sub("-", text.lower()).strip("-")[:max_length]
+#: Reuses the checker's table so the corpus is repaired with exactly the
+#: mapping the grounding check folds by — two definitions could drift apart
+#: and produce a poem the checker no longer matches its own quotes against.
+_MOJIBAKE = grounding.MOJIBAKE_TO_LATIN
 
 
-def make_poem_id(author: str, title: str) -> str:
-    """Return a stable, readable id for a poem.
+def fix_mojibake(poem: dict) -> dict:
+    """Repair Latin-1 accents that were decoded as CP1251 Cyrillic.
 
-    Deterministic across machines and runs, because the fold assignment is
-    built from these ids locally and shipped to Kaggle — an id that changed
-    between environments would silently break the held-out guarantee.
+    Applied per word, and only to words that mix Cyrillic with Latin letters.
+    That mixture is the corruption signature — no real word does it — and
+    restricting to it means a poem quoting genuine Cyrillic is left untouched
+    rather than silently rewritten.
 
-    The trailing hash disambiguates poems whose titles collide after slugging.
+    Worth repairing rather than ignoring: the mangled characters are fed to the
+    model as training text, and they fall on the archaic ``-èd`` ending and on
+    Hopkins's metrical stress marks, so they cluster in exactly the lines a
+    reader would quote.
     """
-    digest = hashlib.sha1(f"{author}|{title}".encode()).hexdigest()[:6]
-    return f"{_slug(author, 20)}--{_slug(title)}--{digest}"
+    def repair(word: str) -> str:
+        if not (_CYRILLIC.search(word) and re.search(r"[A-Za-z]", word)):
+            return word
+        if not all(char in _MOJIBAKE for char in word if _CYRILLIC.match(char)):
+            return word
+        return "".join(_MOJIBAKE.get(char, char) for char in word)
+
+    lines = [_WORD.sub(lambda m: repair(m.group()), line)
+             for line in poem["lines"]]
+    return poem if lines == poem["lines"] else {**poem, "lines": lines}
+
+
+def is_line_numbered(lines: list[str]) -> bool:
+    """Whether ``lines`` carry editorial line numbers rather than poem text.
+
+    Two conditions, both required. Enough lines must carry a leading number
+    (:data:`config.NUMBERED_LINE_THRESHOLD`), and those numbers must ascend.
+    The ascent is what distinguishes an editorial apparatus from a poem that
+    happens to use numerals — real numerals do not count upward line by line.
+
+    Numbers are not compared against their position in the list, because blank
+    stanza-break lines are unnumbered and make the two drift apart: one poem
+    here numbers 40 of its 42 lines while matching its own index on only 12.
+    """
+    present = [line for line in lines if line.strip()]
+    if len(present) < 2:
+        return False
+
+    numbers = [int(match.group(1)) for line in present
+               if (match := _LINE_NUMBER.match(line))]
+    if len(numbers) < 2:
+        return False
+    if len(numbers) / len(present) < config.NUMBERED_LINE_THRESHOLD:
+        return False
+    return all(a < b for a, b in zip(numbers, numbers[1:]))
+
+
+def strip_line_numbers(poem: dict) -> dict:
+    """Remove editorial line numbers, leaving the poem otherwise untouched.
+
+    These corrupt two things at once. The number is fed to the model as part of
+    the poem, and it sits *between* consecutive lines in the joined text, so a
+    correctly-quoted couplet fails the grounding check — a false hallucination
+    verdict on a quote that is verbatim right.
+
+    Applied at load time rather than at fetch time, so the cached JSON stays a
+    faithful copy of what PoetryDB served. Cleaning is re-derived on every load
+    and a change to the rule costs nothing to apply.
+    """
+    if not is_line_numbered(poem["lines"]):
+        return poem
+    return {**poem, "lines": [_LINE_NUMBER.sub("", line)
+                              for line in poem["lines"]]}
+
+
+def sort_key(poem: dict) -> tuple[str, str, str]:
+    """Ordering used to number poems. Depends only on content.
+
+    Fetch order is not stable — it depends on which authors were already
+    cached, and on whether the bulk endpoint or the per-title fallback served
+    a given author. Numbering by fetch order would mean that deleting the
+    cache and re-fetching renumbers the corpus, silently repointing every
+    stored interpretation and fold assignment at a different poem.
+
+    Sorting by content instead makes the numbering reproducible: the same
+    corpus yields the same numbers on any machine, in any fetch order.
+    """
+    return (poem["author"], poem["title"], "\n".join(poem["lines"]))
+
+
+def assign_ids(poems: list[dict]) -> list[dict]:
+    """Number poems 1..N in a deterministic order.
+
+    Sequential integers rather than a hash: they are readable, and the earlier
+    hash of author-and-title was not unique — poets reuse titles, so Blake's
+    two "Holy Thursday" collided onto one id and an interpretation could be
+    scored against a poem the teacher never saw.
+
+    The numbering is positional, so it is only stable while the corpus is
+    fixed. Adding or removing a poem shifts every id after it, which would
+    invalidate the interpretations and the fold assignment keyed to them. The
+    corpus is complete, so that is acceptable — but do not renumber after
+    generation has run.
+    """
+    return [{**poem, "poem_id": index}
+            for index, poem in enumerate(sorted(poems, key=sort_key), start=1)]
 
 
 def _get_json(url: str, max_retries: int | None = None,
@@ -103,10 +199,8 @@ def _normalise(record: dict, author: str) -> dict:
     PoetryDB returns ``linecount`` as a *string*; it becomes an ``int`` here so
     nothing downstream has to remember that.
     """
-    title = record["title"]
     return {
-        "poem_id": make_poem_id(author, title),
-        "title": title,
+        "title": record["title"],
         "author": author,
         "lines": record["lines"],
         "linecount": int(record["linecount"]),
@@ -191,13 +285,44 @@ def fetch_author_poems(author: str) -> list[dict]:
     return [_normalise(record, author) for record in payload]
 
 
+def _deduplicate(poems: list[dict]) -> list[dict]:
+    """Drop records that repeat a poem already seen, keyed on content.
+
+    PoetryDB returns some poems twice, occasionally with different
+    transcription (``Sit still a word`` vs ``SIT stilla word``). Keying on
+    author, title and text means a genuine repeat collapses while two distinct
+    poems that merely share a title — Blake's two "Holy Thursday", Poe's two
+    "To Helen" — are both kept, as they should be.
+    """
+    seen, kept = set(), []
+    for poem in poems:
+        key = sort_key(poem)
+        if key not in seen:
+            seen.add(key)
+            kept.append(poem)
+
+    if len(kept) < len(poems):
+        log.info("dropped %d duplicate records", len(poems) - len(kept))
+    return kept
+
+
 def load_cached() -> list[dict]:
-    """Return every poem already cached, or an empty list if there is none."""
+    """Return every cached poem, cleaned, deduplicated and numbered 1..N.
+
+    Line-number stripping runs *before* numbering, so ids are assigned from the
+    cleaned text and stay consistent with what the rest of the pipeline sees.
+    It affects a handful of poems and leaves ``sort_key`` unchanged for all of
+    them — text is only the third sort field, behind author and title — so ids
+    do not move. ``tests/test_fetch_poems.py`` pins that.
+    """
     path = config.RAW_POEMS_PATH
     if not path.exists():
         return []
     with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        records = [json.loads(line) for line in handle if line.strip()]
+    cleaned = [strip_line_numbers(fix_mojibake(record))
+               for record in records]
+    return assign_ids(_deduplicate(cleaned))
 
 
 def cached_authors() -> set[str]:
@@ -265,52 +390,54 @@ def iter_poems() -> Iterator[dict]:
 
 
 def describe_corpus(poems: list[dict]) -> str:
-    """Return a summary of the raw corpus, before any filtering.
+    """Report whether the fetch is complete. Deliberately not a statistics dump.
 
-    Reported in the data notebook so the corpus is characterised by what was
-    actually retrieved rather than by the number that was hoped for. The
-    in-range count here is a *preview* of one filter stage — the authoritative
-    funnel is built in :mod:`src.data.filter`.
+    This runs immediately after fetching, where the only question is whether
+    everything arrived: PoetryDB 403s an unset user agent and 503s the largest
+    per-author collections, so a partial fetch is the expected failure and it
+    is silent — the pipeline downstream would simply run on a smaller corpus.
+
+    Length distributions, author skew and the singleton count are **not** here.
+    They describe the corpus that survives filtering rather than the one that
+    was downloaded, they are plotted in Figure 2 where a shape is readable in a
+    way a median is not, and printing them twice invites the two to disagree.
+    What was dropped, and why, belongs to the funnel in :mod:`src.data.filter`.
     """
     authors = collections.Counter(poem["author"] for poem in poems)
-    line_counts = sorted(poem["linecount"] for poem in poems)
-    from src.data.filter import within_length_bounds
+    thin = [name for name, count in sorted(authors.items()) if count == 1]
 
-    in_range = [poem for poem in poems if within_length_bounds(poem)]
-    with_sibling = sum(
-        1 for count in collections.Counter(
-            poem["author"] for poem in in_range
-        ).values() if count >= config.MIN_POEMS_PER_AUTHOR_FOR_EVAL
-    )
-
-    biggest = authors.most_common(5)
-    width = max(len(name) for name, _ in biggest)
-    share = "\n".join(
-        f"    {name:<{width}}  {count:>4}  ({count / len(poems):.1%})"
-        for name, count in biggest
-    )
-
-    return (
-        f"raw corpus         {len(poems)} poems from {len(authors)} authors\n"
-        f"lines              median {line_counts[len(line_counts) // 2]}, "
-        f"min {line_counts[0]}, max {line_counts[-1]}\n"
-        f"usable length      {len(in_range)} "
-        f"({len(in_range) / len(poems):.0%})  "
-        f"[>= {config.MIN_LINES} lines, <= {config.MAX_POEM_TOKENS} tokens]\n"
-        f"authors with >= {config.MIN_POEMS_PER_AUTHOR_FOR_EVAL} in-range poems   "
-        f"{with_sibling}\n"
-        f"\n  largest collections — these dominate the grouped folds:\n{share}"
-    )
+    lines = [
+        f"fetched            {len(poems)} poems from {len(authors)} authors",
+    ]
+    if config.POETRYDB_AUTHOR_COUNT:
+        missing = config.POETRYDB_AUTHOR_COUNT - len(authors)
+        lines.append(
+            f"author coverage    {len(authors)}/{config.POETRYDB_AUTHOR_COUNT}"
+            + (f"  — {missing} MISSING, re-run the fetch" if missing > 0 else "  complete")
+        )
+    if thin:
+        lines.append(f"single-poem authors {len(thin)}  "
+                     f"(a truncated fetch looks like this)")
+    return "\n".join(lines)
 
 
-def show_example(poem: dict, max_lines: int = 8) -> None:
-    """Print one poem readably, for display in a notebook."""
+def show_example(poem: dict, max_lines: int | None = 8) -> None:
+    """Print one poem readably, for display in a notebook.
+
+    ``max_lines=None`` prints the poem in full. Use that wherever the poem is
+    being read against an interpretation — a truncated poem cannot be checked
+    against a quote drawn from the part that was cut.
+    """
     print(f"{poem['title']}\n{poem['author']}  ({poem['linecount']} lines)")
-    print("-" * 48)
-    for line in poem["lines"][:max_lines]:
+    print("-" * 60)
+
+    lines = poem["lines"] if max_lines is None else poem["lines"][:max_lines]
+    for line in lines:
         print(line)
-    if poem["linecount"] > max_lines:
-        print(f"... ({poem['linecount'] - max_lines} more lines)")
+
+    remaining = poem["linecount"] - len(lines)
+    if remaining > 0:
+        print(f"... ({remaining} more lines)")
 
 
 if __name__ == "__main__":

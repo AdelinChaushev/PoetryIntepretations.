@@ -1,6 +1,8 @@
 # Secrets — API keys live in the shell environment, never in the repo
 .env
 .env.*
+# .env.example holds placeholders only and is safe to commit.
+!.env.example
 *.key
 
 # Data: the corpus is regenerable from PoetryDB and too large to track.

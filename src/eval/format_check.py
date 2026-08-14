@@ -19,6 +19,7 @@ The schema, from the teacher prompt in ``config.TEACHER_PROMPT_TEMPLATE``:
 
 from __future__ import annotations
 
+import collections
 import re
 
 #: Expected part labels, in order. Matching is on the *number*, with the label
@@ -97,3 +98,40 @@ def compliance_rate(interpretations: list[str]) -> float:
     if not interpretations:
         return 0.0
     return sum(is_compliant(text) for text in interpretations) / len(interpretations)
+
+
+#: Words too common to say anything about a part's content.
+_STOPWORDS = frozenset(
+    "a an and the of to in is are with but or as its it this that for on at by "
+    "from be been being was were has have had which who whom whose".split()
+)
+
+
+def part_vocabulary(interpretations: list[str], part: int,
+                    drop_label: bool = True) -> collections.Counter:
+    """Count the content words used in one part across many interpretations.
+
+    Written for the tone slot, where the failure is invisible in every other
+    metric: an interpretation can follow the schema perfectly and quote
+    accurately while part 3 says "reflective and melancholy" every single time.
+    That is template text in a slot the format check will happily pass, and a
+    student trained on it learns the word rather than the judgement.
+
+    A near-flat distribution means the teacher is reading each poem; one word
+    dominating means it is not.
+    """
+    counter: collections.Counter = collections.Counter()
+
+    for text in interpretations:
+        body = parse_parts(text).get(part, "")
+        if drop_label:
+            body = _LABEL.sub("", body, count=1)
+        words = re.findall(r"[a-z]+", body.lower())
+        counter.update(w for w in words if w not in _STOPWORDS and len(w) > 2)
+
+    return counter
+
+
+def part_texts(interpretations: list[str], part: int) -> list[str]:
+    """Return the raw text of one part from each interpretation."""
+    return [parse_parts(text).get(part, "").strip() for text in interpretations]

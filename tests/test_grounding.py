@@ -139,3 +139,49 @@ def test_grounding_rate_over_pairs():
     assert grounding.grounding_rate([(good, POEM), (good, POEM)]) == 1.0
     assert grounding.grounding_rate([(good, POEM), (bad, POEM)]) == 0.5
     assert grounding.grounding_rate([]) == 0.0
+
+
+# --- source markup ----------------------------------------------------------
+
+def test_underscore_emphasis_does_not_break_a_correct_quote():
+    """PoetryDB marks emphasis with underscores. `\\w` counts `_` as a word
+    character, so a naive punctuation strip leaves it in and a verbatim quote
+    fails the substring test — a false ungrounded verdict on 6.7% of poems."""
+    poem = {"lines": ["May your fate be like _hers_ and unlike _mine_"]}
+    interpretation = 'The close pleads: "may your fate be like hers and unlike mine"'
+    assert grounding.check(interpretation, poem)["grounded"]
+
+
+def test_underscore_stripping_does_not_glue_words_together():
+    """Replaced with a space, not deleted — `a_b` is two words, not `ab`."""
+    assert grounding.normalise("_hers_ and _mine_") == "hers and mine"
+    assert grounding.normalise("fate_be") == "fate be"
+
+
+def test_invented_line_is_still_ungrounded():
+    """Normalisation must not rescue a quote the poem does not contain."""
+    poem = {"lines": ["May your fate be like _hers_ and unlike _mine_"]}
+    assert not grounding.check('It says "a line never written here"', poem)["grounded"]
+
+
+# --- accents and ligatures ----------------------------------------------------
+
+def test_metrical_accent_does_not_break_a_quote():
+    """The accent in "Deservèd" marks scansion, not a different word."""
+    poem = {"lines": ["Deservèd yet an end whose every part"]}
+    assert grounding.is_grounded("Deserved yet an end", poem)
+
+
+def test_hopkins_stress_marks_fold():
+    poem = {"lines": ["That hére pérsonal tells off these heart-song powerful peals"]}
+    assert grounding.is_grounded("that here personal tells off", poem)
+
+
+def test_ligature_matches_its_expansion():
+    poem = {"lines": ["O Cæsar, we who are about to die"]}
+    assert grounding.is_grounded("O Caesar, we who are about to die", poem)
+
+
+def test_folding_does_not_ground_a_different_word():
+    poem = {"lines": ["Deservèd yet an end whose every part"]}
+    assert not grounding.is_grounded("deserted yet an end", poem)
