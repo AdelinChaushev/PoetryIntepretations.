@@ -218,3 +218,24 @@ def test_the_kaggle_cell_installs_trl():
     install = "".join("".join(c["source"]) for c in notebook["cells"]
                       if "pip" in "".join(c["source"]))
     assert "trl" in install
+
+
+def test_the_kaggle_cell_reclones_rather_than_skipping():
+    """/kaggle/working persists across executions within a session, so a
+    conditional 'clone if absent' means pushing a fix and re-running still
+    executes the OLD code — silently, with no error and no hint in the log.
+
+    That failure is expensive precisely because it looks like the fix did not
+    work, sending you back to the code rather than to the checkout.
+    """
+    import json
+
+    notebook = json.loads(
+        (config.PROJECT_ROOT / "notebooks" / "04_training.ipynb").read_text())
+    cell = next("".join(c["source"]) for c in notebook["cells"]
+                if "git" in "".join(c["source"]) and "clone" in "".join(c["source"]))
+
+    assert "rmtree" in cell, "the checkout is reused rather than refreshed"
+    assert "not CHECKOUT.exists()" not in cell
+    # The commit must be printed, so the log says which code produced the run.
+    assert "rev-parse" in cell
