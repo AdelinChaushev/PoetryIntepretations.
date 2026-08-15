@@ -207,6 +207,17 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
     # gets input indices while embed_tokens keeps its weights on cuda:0. The
     # resulting error names neither DataParallel nor the device count, and
     # arrives only once training has started.
+    # Training on CPU is not an error anywhere in torch -- it is a warning at
+    # most ("no accelerator is found") and then it simply runs, roughly two
+    # orders of magnitude slower. On Kaggle that means a session spent producing
+    # nothing, discovered only when the clock runs out. SMOKE is exempt: it is a
+    # size flag and is meant to run on a laptop.
+    assert torch.cuda.is_available() or config.SMOKE, (
+        "no GPU is visible, so this run would train on CPU -- silently, and far "
+        "too slowly to finish. Check Settings -> Accelerator in the Kaggle "
+        "sidebar (a session restart can drop it, and so can the weekly quota). "
+        "Set SMOKE=1 if a tiny CPU run is what you actually want.")
+
     visible = torch.cuda.device_count()
     assert visible <= 1, (
         f"{visible} GPUs are visible, so Trainer will use nn.DataParallel and "

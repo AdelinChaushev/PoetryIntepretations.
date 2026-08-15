@@ -217,3 +217,18 @@ def test_every_row_has_the_same_column_count(tmp_path, monkeypatch):
     widths = {len(line.split(",")) for line in
               path.read_text().strip().splitlines()}
     assert len(widths) == 1, f"rows have differing widths: {widths}"
+
+
+def test_training_refuses_to_run_on_cpu_outside_smoke():
+    """torch does not error when a GPU is absent -- it warns ("no accelerator
+    is found") and runs, about two orders of magnitude slower. On Kaggle that
+    is a session spent producing nothing, noticed only when the clock ends.
+
+    SMOKE is exempt: it is a size flag and is meant to run on a laptop.
+    """
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.train)
+    assert "torch.cuda.is_available() or config.SMOKE" in source
