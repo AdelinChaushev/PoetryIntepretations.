@@ -219,6 +219,13 @@ def test_the_kaggle_cell_installs_trl():
                       if "pip" in "".join(c["source"]))
     assert "trl" in install
 
+    # Kaggle ships torchao 0.10; peft needs >= 0.16 and RAISES on an older one
+    # rather than returning False, from a dispatcher it calls unconditionally.
+    # get_peft_model then dies on a library this project never uses -- it
+    # trains LoRA on bf16 weights with no quantization at all.
+    assert "torchao" in install, (
+        "peft will raise on Kaggle's torchao 0.10 before any training starts")
+
 
 def test_the_kaggle_cell_reclones_rather_than_skipping():
     """/kaggle/working persists across executions within a session, so a

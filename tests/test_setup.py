@@ -103,3 +103,47 @@ def test_smoke_targets_match_the_smoke_model():
         assert config.LORA_TARGET_MODULES == ("c_attn",)
     else:
         assert "q_proj" in config.LORA_TARGET_MODULES
+
+
+# --- precision must agree between the model and the trainer --------------------
+
+def test_bf16_support_is_the_strict_ampere_check():
+    """torch.cuda.is_bf16_supported() counts EMULATION and returns True on
+    Turing; TrainingArguments requires Ampere and raises otherwise.
+
+    Observed on a Kaggle T4: the model loaded as bfloat16 and SFTConfig then
+    refused to construct. Using the loose check for the dtype and letting
+    transformers apply the strict one to the trainer is the whole bug.
+    """
+    import inspect
+
+    from src.model import setup
+
+    source = inspect.getsource(setup.supports_bf16)
+    assert "get_device_capability" in source
+    assert "major >= 8" in source
+
+
+def test_the_model_dtype_and_the_trainer_agree():
+    """One helper decides both, so a card can never get bf16 weights and an
+    fp16 trainer — or the reverse."""
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.training_arguments)
+    assert "setup.supports_bf16()" in source
+    # The CALL, not the word: the comment above it names torch's check in order
+    # to explain why it is not used, and an earlier version of this test matched
+    # that prose and failed.
+    assert "torch.cuda.is_bf16_supported()" not in source
+
+
+def test_cpu_reports_no_bf16():
+    import torch
+
+    from src.model import setup
+
+    if not torch.cuda.is_available():
+        assert setup.supports_bf16() is False
+        assert setup.dtype() is torch.float32

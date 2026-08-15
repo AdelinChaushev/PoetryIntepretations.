@@ -33,6 +33,30 @@ def device() -> str:
     return "cpu"
 
 
+def supports_bf16() -> bool:
+    """True only on hardware ``transformers`` will ACCEPT for bf16 training.
+
+    Not ``torch.cuda.is_bf16_supported()``, which returns **True on Turing**
+    because it counts emulation. ``TrainingArguments`` applies a stricter rule —
+    Ampere or newer — and raises "Your setup doesn't support bf16/gpu".
+
+    Using the loose check to pick the model dtype while transformers applies the
+    strict one to the trainer is how a model gets loaded in bf16 and then
+    refused by the trainer meant to train it. Observed on a Kaggle T4: the model
+    loaded as bfloat16 and SFTConfig would not construct.
+
+    Compute capability 8.0 is Ampere. T4 is 7.5 and P100 is 6.0 — the two cards
+    this project targets — so this is False on both and everything downstream
+    agrees on fp16.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8
+
+
 def dtype():
     """bf16 on hardware that supports it, fp16 on older cards, fp32 on CPU.
 
@@ -44,7 +68,7 @@ def dtype():
 
     if not torch.cuda.is_available():
         return torch.float32
-    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.bfloat16 if supports_bf16() else torch.float16
 
 
 def load_tokenizer():

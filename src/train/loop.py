@@ -128,7 +128,14 @@ def training_arguments(run_name: str, steps: int, output_dir, **overrides):
     import torch
     from trl import SFTConfig
 
+    from src.model import setup
+
     use_cuda = torch.cuda.is_available()
+    # setup.supports_bf16, not torch.cuda.is_bf16_supported: the torch check
+    # counts emulation and returns True on Turing, while TrainingArguments
+    # requires Ampere and raises. Routed through the same helper that picks the
+    # model dtype, so the weights and the trainer cannot disagree.
+    bf16 = setup.supports_bf16()
     return SFTConfig(
         output_dir=str(output_dir),
         max_steps=steps,
@@ -163,8 +170,8 @@ def training_arguments(run_name: str, steps: int, output_dir, **overrides):
         # truncated poem is still scored against its full text by the grounding
         # checker.
         max_length=config.MAX_SEQ_LEN,
-        bf16=use_cuda and torch.cuda.is_bf16_supported(),
-        fp16=use_cuda and not torch.cuda.is_bf16_supported(),
+        bf16=bf16,
+        fp16=use_cuda and not bf16,
         seed=config.SEED,
         data_seed=config.SEED,
         report_to=[],
@@ -191,6 +198,22 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
     from datasets import Dataset
     from transformers import EarlyStoppingCallback
     from trl import SFTTrainer
+
+    import torch
+
+    # Fail here, clearly, rather than inside a DataParallel worker thread.
+    # With >1 visible GPU, Trainer wraps the model in nn.DataParallel, which
+    # replicates it per batch and breaks under PEFT -- the replica on cuda:1
+    # gets input indices while embed_tokens keeps its weights on cuda:0. The
+    # resulting error names neither DataParallel nor the device count, and
+    # arrives only once training has started.
+    visible = torch.cuda.device_count()
+    assert visible <= 1, (
+        f"{visible} GPUs are visible, so Trainer will use nn.DataParallel and "
+        f"fail under PEFT with a device mismatch. Set CUDA_VISIBLE_DEVICES=0 "
+        f"BEFORE torch initialises CUDA (the first notebook cell), or choose a "
+        f"single-GPU accelerator. Nothing is lost: a 0.5B model with LoRA fits "
+        f"on one card and the batch is too small to split usefully.")
 
     stopping = config.EARLY_STOPPING if early_stopping is None else early_stopping
     train_set, validation = split_validation(examples, pairs)
