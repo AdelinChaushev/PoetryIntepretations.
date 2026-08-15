@@ -209,3 +209,32 @@ def load_adapter(path, base=None):
     adapted = PeftModel.from_pretrained(model, str(path))
     log.info("loaded adapter %s onto %s", path, config.MODEL)
     return adapted
+
+
+#: LoRA needs a learning rate one to two orders of magnitude above full
+#: fine-tuning's. Only ~0.9% of the weights are trainable, they start at zero on
+#: the B side, and the update is scaled by alpha/r — so a rate copied from a
+#: full fine-tuning recipe (1e-5 to 5e-5) barely moves the adapter and produces
+#: a run that completes with a nearly flat loss curve.
+LORA_LEARNING_RATE_RANGE: tuple[float, float] = (5e-5, 1e-3)
+
+
+def assert_matched_learning_rate(method: str, learning_rate: float) -> None:
+    """The learning rate must suit the adaptation method.
+
+    A guard against the quietest configuration error in the sweep: a full
+    fine-tuning learning rate applied to LoRA. Nothing raises, the run completes,
+    the loss curve is nearly flat — and "fine-tuning did not help" is this
+    project's own H2 prediction, so the result looks like a finding rather than
+    a mistake.
+    """
+    if method != "lora":
+        return
+
+    low, high = LORA_LEARNING_RATE_RANGE
+    assert low <= learning_rate <= high, (
+        f"learning rate {learning_rate:g} is outside the range LoRA needs "
+        f"({low:g} to {high:g}). Below it the adapter barely moves and the run "
+        f"finishes with a flat loss curve, which is indistinguishable from "
+        f"'fine-tuning did not help' — the very thing H2 predicts. Above it the "
+        f"adapter diverges.")

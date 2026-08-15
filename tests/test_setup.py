@@ -147,3 +147,56 @@ def test_cpu_reports_no_bf16():
     if not torch.cuda.is_available():
         assert setup.supports_bf16() is False
         assert setup.dtype() is torch.float32
+
+
+# --- the learning rate must suit the method -----------------------------------
+
+def test_the_whole_lr_sweep_is_accepted():
+    """Every rate the sweep will actually try must pass, or the guard would
+    reject the experiment it exists to protect."""
+    from src.model import setup
+
+    for lr in config.LR_SWEEP:
+        setup.assert_matched_learning_rate("lora", lr)
+    setup.assert_matched_learning_rate("lora", config.LEARNING_RATE)
+
+
+def test_a_full_finetuning_rate_is_rejected():
+    """The quietest configuration error in the sweep. Only ~0.9% of weights are
+    trainable and the B side starts at zero, so 2e-5 barely moves the adapter —
+    the run completes with a nearly flat loss curve, which looks exactly like
+    'fine-tuning did not help', this project's own H2 prediction."""
+    from src.model import setup
+
+    try:
+        setup.assert_matched_learning_rate("lora", 2e-5)
+    except AssertionError as error:
+        assert "flat loss curve" in str(error)
+        return
+    raise AssertionError("a full fine-tuning learning rate was accepted for LoRA")
+
+
+def test_a_diverging_rate_is_rejected():
+    from src.model import setup
+
+    try:
+        setup.assert_matched_learning_rate("lora", 0.1)
+    except AssertionError:
+        return
+    raise AssertionError("a diverging learning rate was accepted")
+
+
+def test_run_one_can_actually_be_called():
+    """The dangling reference this replaces: run_one called
+    setup.assert_matched_learning_rate, which did not exist. Tests exercised
+    plan() and final_specs() but never run_one's body, so the sweep failed on
+    its first real run instead of in CI."""
+    import inspect
+
+    from src.model import setup
+    from src.train import sweep
+
+    source = inspect.getsource(sweep.run_one)
+    for name in {line.split("setup.")[1].split("(")[0]
+                 for line in source.splitlines() if "setup." in line}:
+        assert hasattr(setup, name), f"sweep.run_one calls missing setup.{name}"
