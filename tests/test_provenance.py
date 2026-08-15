@@ -235,7 +235,17 @@ def test_the_kaggle_cell_reclones_rather_than_skipping():
     cell = next("".join(c["source"]) for c in notebook["cells"]
                 if "git" in "".join(c["source"]) and "clone" in "".join(c["source"]))
 
-    assert "rmtree" in cell, "the checkout is reused rather than refreshed"
+    assert "shutil.rmtree(" in cell, "the checkout is reused rather than refreshed"
+    # The kernel ends the PREVIOUS run inside the checkout (os.chdir(ROOT)), so
+    # it must step out before deleting it. Otherwise the process is left with no
+    # valid working directory and git fails with "Unable to read current working
+    # directory" -- an error naming neither the chdir nor the removal.
+    #
+    # Matched on the calls, not on the words: an earlier version of this test
+    # found "rmtree" inside the comment explaining it and failed on prose.
+    assert (cell.index('os.chdir("/kaggle/working")')
+            < cell.index("shutil.rmtree(")), (
+        "the checkout is removed while the kernel is still inside it")
     assert "not CHECKOUT.exists()" not in cell
     # The commit must be printed, so the log says which code produced the run.
     assert "rev-parse" in cell
