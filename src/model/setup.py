@@ -1,0 +1,171 @@
+"""Load the student and attach LoRA adapters.
+
+Runs on Kaggle. Everything here is guarded so the module can be imported — and
+smoke-tested — on a laptop with no GPU, because the two modules that never
+otherwise run locally are the two where a bug costs a GPU session to discover.
+
+**The base model is frozen and that is asserted, not assumed.** ``peft`` freezes
+it for us, but a mis-specified ``target_modules`` matches nothing, trains zero
+parameters, and produces a run that completes with a flat loss curve and an
+adapter full of zeros. :func:`assert_adapters_only` turns both failures into
+errors.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import config
+
+log = logging.getLogger(__name__)
+
+
+def device() -> str:
+    """Where to put the model. Never assumes CUDA at import time."""
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch absent on the laptop
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def dtype():
+    """bf16 on hardware that supports it, fp16 on older cards, fp32 on CPU.
+
+    T4 (Turing) and P100 (Pascal) predate bf16, so this cannot be hardcoded —
+    requesting bf16 there is either an error or a silent fallback that halves
+    throughput.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return torch.float32
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def load_tokenizer():
+    """Load the student's tokeniser, with a pad token guaranteed.
+
+    Qwen and GPT-2 both ship without a distinct pad token. Left unset, the
+    collator has nothing to pad with; set to EOS without care, the model would
+    be unable to tell padding from a genuine end of sequence. Padding is masked
+    out of the loss and out of attention either way, so reusing EOS is safe —
+    but it has to be deliberate rather than a default.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(config.MODEL)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        log.info("pad_token was unset; using eos_token (%s). Padding is masked "
+                 "in labels and attention, so this cannot leak into the loss.",
+                 tokenizer.eos_token_id)
+    return tokenizer
+
+
+def load_base_model():
+    """Load the frozen student.
+
+    Base, not Instruct — an instruction-tuned checkpoint would already follow
+    the output schema, which would contaminate the format-compliance
+    measurement that H1 is about.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.MODEL,
+        dtype=dtype(),
+        low_cpu_mem_usage=True,
+    )
+    model.config.use_cache = False  # incompatible with gradient checkpointing
+    log.info("loaded %s (%s params) on %s as %s", config.MODEL,
+             f"{sum(p.numel() for p in model.parameters()):,}", device(), dtype())
+    return model.to(device())
+
+
+def lora_config(rank: int | None = None, target_modules=None, dropout=None):
+    """Build the peft config for a given rank.
+
+    ``alpha`` is DERIVED from the rank rather than fixed, so the ``alpha / r``
+    scaling stays constant across the rank sweep. With alpha fixed, sweeping
+    {4, 8, 16} would vary the scaling 4x, 2x, 1x and the axis would measure
+    capacity and effective step size together.
+    """
+    from peft import LoraConfig
+
+    rank = config.LORA_RANK if rank is None else rank
+    return LoraConfig(
+        r=rank,
+        lora_alpha=config.lora_alpha(rank),
+        lora_dropout=config.LORA_DROPOUT if dropout is None else dropout,
+        target_modules=list(target_modules or config.LORA_TARGET_MODULES),
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+
+def apply_lora(model, rank: int | None = None, target_modules=None):
+    """Attach adapters and verify that only they are trainable."""
+    from peft import get_peft_model
+
+    adapted = get_peft_model(model, lora_config(rank, target_modules))
+    assert_adapters_only(adapted)
+    log.info("LoRA r=%d alpha=%d on %s", rank or config.LORA_RANK,
+             config.lora_alpha(rank or config.LORA_RANK),
+             list(target_modules or config.LORA_TARGET_MODULES))
+    return adapted
+
+
+def trainable_parameters(model) -> dict:
+    """Trainable and total parameter counts."""
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return {"trainable": trainable, "total": total,
+            "percent": 100 * trainable / total if total else 0.0}
+
+
+def assert_adapters_only(model) -> None:
+    """Only LoRA parameters may be trainable, and there must be some.
+
+    Two failures, both silent. A mis-specified ``target_modules`` matches
+    nothing: the run completes, the loss curve is flat, and the saved adapter
+    is empty — which looks like "fine-tuning did not help", the project's own
+    H2 prediction. And a base weight left unfrozen would make the run a partial
+    full fine-tune reported as LoRA.
+    """
+    counts = trainable_parameters(model)
+    assert counts["trainable"] > 0, (
+        f"no trainable parameters — target_modules "
+        f"{list(config.LORA_TARGET_MODULES)} matched nothing in {config.MODEL}. "
+        f"The run would complete with a flat loss curve and an empty adapter, "
+        f"which is indistinguishable from 'fine-tuning did not help'."
+    )
+    leaked = [name for name, param in model.named_parameters()
+              if param.requires_grad and "lora_" not in name]
+    assert not leaked, (
+        f"{len(leaked)} non-adapter parameters are trainable, starting with "
+        f"{leaked[:3]} — this is a partial full fine-tune, not LoRA"
+    )
+    log.info("trainable %s / %s (%.2f%%) — adapters only",
+             f"{counts['trainable']:,}", f"{counts['total']:,}",
+             counts["percent"])
+
+
+def save_adapter(model, path) -> None:
+    """Write the adapter, which records its own base model in the config.
+
+    Never the merged model: merged into the base it is ~1 GB in fp16, past
+    GitHub's file limit, and reconstructible from these two files in one line.
+    """
+    from pathlib import Path
+
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(path)
+    size = sum(f.stat().st_size for f in path.glob("*")) / 1024**2
+    log.info("adapter written to %s (%.1f MB)", path, size)

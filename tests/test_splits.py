@@ -194,3 +194,221 @@ def test_too_few_eligible_poems_raises_rather_than_silently_shrinking():
 
     with pytest.raises(ValueError, match="are needed"):
         splits.sample_eval_poems(folds, per_fold=99, seed=42)
+
+
+# --- the Kaggle handoff -------------------------------------------------------
+
+def test_save_writes_both_artifacts(tmp_path, monkeypatch):
+    """The assignment names poem ids; only the pairs file says which poems those
+    are. Shipping one without the other leaves the GPU side rebuilding the
+    corpus from raw inputs."""
+    import json
+
+    import config
+    from src.data import splits
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "FOLD_ASSIGNMENT_PATH", tmp_path / "folds.json")
+    monkeypatch.setattr(config, "TRAINING_PAIRS_PATH", tmp_path / "pairs.jsonl")
+
+    # Two authors minimum: a group is never split across folds, so k folds
+    # need k distinct authors.
+    pairs = [{"poem_id": i, "author": "AB"[i % 2], "title": "t",
+              "lines": ["x"], "linecount": 1, "interpretation": f"about {i}"}
+             for i in range(1, 7)]
+    folds = splits.make_folds(pairs, 2, group_key="author", seed=0)
+    splits.save(folds, [], [], pairs=pairs)
+
+    assert config.FOLD_ASSIGNMENT_PATH.exists()
+    assert config.TRAINING_PAIRS_PATH.exists()
+    written = splits.load_training_pairs()
+    assert len(written) == len(pairs)
+    assert [p["poem_id"] for p in written] == sorted(p["poem_id"] for p in pairs)
+
+
+def test_saved_pairs_keep_their_interpretations(tmp_path, monkeypatch):
+    """Without the interpretation there is nothing to train on, and the failure
+    would only surface on the GPU."""
+    import config
+    from src.data import splits
+
+    monkeypatch.setattr(config, "FOLD_ASSIGNMENT_PATH", tmp_path / "folds.json")
+    monkeypatch.setattr(config, "TRAINING_PAIRS_PATH", tmp_path / "pairs.jsonl")
+    pairs = [{"poem_id": 1, "author": "A", "title": "t", "lines": ["x"],
+              "linecount": 1, "interpretation": "the interpretation"},
+             {"poem_id": 2, "author": "B", "title": "t", "lines": ["y"],
+              "linecount": 1, "interpretation": "another"}]
+    folds = splits.make_folds(pairs, 2, group_key="author", seed=0)
+    splits.save(folds, [], [], pairs=pairs)
+    assert splits.load_training_pairs()[0]["interpretation"] == "the interpretation"
+
+
+def test_missing_pairs_warns_rather_than_silently_skipping(tmp_path, monkeypatch,
+                                                           caplog):
+    import config
+    from src.data import splits
+
+    monkeypatch.setattr(config, "FOLD_ASSIGNMENT_PATH", tmp_path / "folds.json")
+    monkeypatch.setattr(config, "TRAINING_PAIRS_PATH", tmp_path / "pairs.jsonl")
+    pairs = [{"poem_id": 1, "author": "A", "title": "t", "lines": ["x"],
+              "linecount": 1, "interpretation": "x"},
+             {"poem_id": 2, "author": "B", "title": "t", "lines": ["y"],
+              "linecount": 1, "interpretation": "y"}]
+    folds = splits.make_folds(pairs, 2, group_key="author", seed=0)
+    with caplog.at_level("WARNING"):
+        splits.save(folds, [], [])
+    assert "training pairs NOT written" in caplog.text
+
+
+# --- the training partition ---------------------------------------------------
+
+def test_training_partition_excludes_the_held_out_fold():
+    from src.data import splits
+
+    pairs = [{"poem_id": i, "author": "A"} for i in range(1, 7)]
+    fold_of = {1: 0, 2: 0, 3: 1, 4: 1, 5: 2, 6: 2}
+    training = splits.training_partition(pairs, fold=0, fold_of=fold_of)
+    assert {p["poem_id"] for p in training} == {3, 4, 5, 6}
+
+
+def test_partition_raises_when_the_filter_removes_nothing():
+    """The bug this replaced: the pairs file carries no fold_id, so an inline
+    `p.get("fold_id") != fold` was true for every poem and every run trained on
+    its own held-out fold. Silently."""
+    from src.data import splits
+
+    pairs = [{"poem_id": i, "author": "A"} for i in range(1, 4)]
+    try:
+        splits.training_partition(pairs, fold=99, fold_of={1: 0, 2: 0, 3: 0})
+    except AssertionError as error:
+        assert "removed nothing" in str(error)
+        return
+    raise AssertionError("a no-op fold filter was accepted")
+
+
+def test_partition_raises_without_an_assignment():
+    from src.data import splits
+
+    try:
+        splits.training_partition([{"poem_id": 1}], fold=0, fold_of={})
+    except AssertionError:
+        return
+    raise AssertionError("filtering proceeded with no fold assignment")
+
+
+def test_assignment_keys_are_integers():
+    """JSON stringifies dict keys. A lookup with the wrong type returns None,
+    which every caller reads as 'not in this fold'."""
+    from src.data import splits
+
+    mapping = splits.load_assignment()
+    if mapping:
+        assert all(isinstance(k, int) for k in mapping)
+
+
+# --- a fold never trains on the poems it holds out ----------------------------
+
+def test_partition_rejects_a_poem_this_fold_holds_out(monkeypatch):
+    """The invariant the whole held-out guarantee rests on, asserted directly.
+
+    Checked against the evaluation record rather than inferred from the fold
+    lookup, because ``mapping.get(id)`` returns None both for a deliberately
+    unassigned exemplar author and for a poem the assignment failed to cover.
+    Only the second is a bug, and the two are indistinguishable at the lookup.
+    """
+    from src.data import splits
+
+    pairs = [{"poem_id": i} for i in range(1, 6)]
+    # Poem 4 is evaluated by fold 0, but `mapping` puts it in fold 1, so a
+    # fold-0 run would happily train on the poem it is later judged on.
+    monkeypatch.setattr(splits, "load_evaluation_folds", lambda: {4: 0})
+
+    try:
+        splits.training_partition(pairs, fold=0,
+                                  fold_of={1: 0, 2: 1, 3: 1, 4: 1, 5: 1})
+    except AssertionError as error:
+        assert "EVALUATION" in str(error)
+        return
+    raise AssertionError("a fold trained on a poem it holds out")
+
+
+def test_partition_catches_the_key_type_mismatch(monkeypatch):
+    """The failure ``load_assignment``'s docstring warns about, made to fail.
+
+    String keys make every int lookup return None, every poem reads as "not in
+    this fold", and the held-out poems land in training. The older "removed
+    nothing" assertion does not fire, because one poem still happens to filter.
+    """
+    from src.data import splits
+
+    pairs = [{"poem_id": i} for i in range(1, 6)]
+    monkeypatch.setattr(splits, "load_evaluation_folds", lambda: {2: 0, 3: 0})
+
+    try:
+        splits.training_partition(pairs, fold=0,
+                                  fold_of={"2": 0, "3": 0, "4": 1, 1: 0})
+    except AssertionError as error:
+        assert "EVALUATION" in str(error)
+        return
+    raise AssertionError("a stringified assignment was accepted")
+
+
+def test_other_folds_evaluation_poems_are_trainable(monkeypatch):
+    """Must NOT raise. An evaluation poem belonging to fold 3 is generated by
+    fold 3's adapter, so fold 0 training on it breaks nothing — over-strictness
+    here would throw away 120 of the 150 for no reason."""
+    from src.data import splits
+
+    pairs = [{"poem_id": i} for i in range(1, 6)]
+    monkeypatch.setattr(splits, "load_evaluation_folds", lambda: {2: 3, 5: 0})
+
+    training = splits.training_partition(pairs, fold=0,
+                                         fold_of={1: 1, 2: 3, 4: 1, 5: 0})
+    assert 2 in {p["poem_id"] for p in training}     # fold 3's, trainable here
+    assert 5 not in {p["poem_id"] for p in training}  # fold 0's own, excluded
+
+
+def test_unassigned_exemplar_authors_are_still_allowed(monkeypatch):
+    """Also must not raise: exemplar-author poems carry no fold at all and
+    belong in every run's training set, because they are never evaluated on."""
+    from src.data import splits
+
+    pairs = [{"poem_id": i} for i in range(1, 6)]
+    monkeypatch.setattr(splits, "load_evaluation_folds", lambda: {5: 0})
+
+    training = splits.training_partition(pairs, fold=0,
+                                         fold_of={1: 1, 2: 0, 4: 1, 5: 0})
+    assert 3 in {p["poem_id"] for p in training}     # no fold — an exemplar author
+
+
+def test_evaluation_fold_keys_are_integers():
+    from src.data import splits
+
+    folds = splits.load_evaluation_folds()
+    if folds:
+        assert all(isinstance(i, int) for i in folds)
+
+
+def test_the_two_fold_records_agree():
+    """``fold_of`` and ``eval_poem_ids`` are written by one save() call and must
+    never drift; a disagreement means one is stale."""
+    from src.data import splits
+
+    mapping, evaluation = splits.load_assignment(), splits.load_evaluation_folds()
+    if mapping and evaluation:
+        assert all(mapping.get(i) == f for i, f in evaluation.items())
+
+
+def test_no_fold_trains_on_its_own_evaluation_poems():
+    """End-to-end on the shipped assignment, for all five folds."""
+    import config
+    from src.data import splits
+
+    pairs = splits.load_training_pairs()
+    evaluation = splits.load_evaluation_folds()
+    if not pairs or not evaluation:
+        return
+
+    for fold in range(config.N_FOLDS):
+        trained = {p["poem_id"] for p in splits.training_partition(pairs, fold)}
+        assert not trained & {i for i, f in evaluation.items() if f == fold}

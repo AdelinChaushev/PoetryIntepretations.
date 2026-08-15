@@ -73,11 +73,43 @@ RESULTS_DIR: Path = _resolve_dir(
 
 RAW_POEMS_PATH: Path = DATA_DIR / "raw_poems.jsonl"
 INTERPRETATIONS_PATH: Path = DATA_DIR / "interpretations.jsonl"
-CORPUS_PATH: Path = DATA_DIR / "corpus.jsonl"
-FOLD_ASSIGNMENT_PATH: Path = DATA_DIR / "folds.json"
-EVAL_POEMS_PATH: Path = DATA_DIR / "eval_poems.jsonl"
+#: The funnel's output: each surviving poem joined with its teacher
+#: interpretation, so one record is one training example. Named for its contents
+#: rather than "corpus", which describes `raw_poems.jsonl` — the poems alone —
+#: and gives no hint that the interpretations are inside.
+#:
+#: Written locally and shipped to Kaggle. NOT rebuilt there: the funnel is a
+#: pure function of the raw files and the thresholds, so rebuilding works right
+#: up until a threshold changes, at which point the GPU side would train on a
+#: different set of poems than the fold assignment describes — and nothing
+#: would raise, because the ids still resolve.
+TRAINING_PAIRS_PATH: Path = DATA_DIR / "training_pairs.jsonl"
 
-RUNS_CSV_PATH: Path = RESULTS_DIR / "runs.csv"
+#: Fold assignment, the evaluation poem ids with their folds, and the exemplar
+#: ids — all three in one file, because they are one decision and separating
+#: them invites shipping a stale half.
+FOLD_ASSIGNMENT_PATH: Path = DATA_DIR / "folds.json"
+
+def _result(name: str) -> Path:
+    """A results path that smoke runs cannot contaminate.
+
+    Under ``SMOKE`` the file is prefixed, so a five-step gpt2 run never lands in
+    a file real results are read from. This is not tidiness — each of these
+    files has a route by which a smoke row would do damage silently:
+
+    * ``runs.csv`` — ``sweep.select_winner`` minimises validation loss, and a
+      tiny model on six examples can post a lower one than a real run, which
+      would return a winning configuration that was never actually trained.
+    * ``arm_outputs.json`` — ``inference.load_cached`` keys on
+      ``(poem_id, arm)`` and takes the newest, so a smoke record silently
+      **replaces** a real generation rather than sitting beside it.
+    * ``contamination.jsonl`` — ``probe_all`` skips ids already present, so a
+      smoke record would suppress the real probe for that poem entirely.
+    """
+    return RESULTS_DIR / (f"smoke_{name}" if SMOKE else name)
+
+
+RUNS_CSV_PATH: Path = _result("runs.csv")
 PRIOR_WORK_CSV_PATH: Path = RESULTS_DIR / "prior_work_comparison.csv"
 
 #: One row per judge from the swap test. Generated, never hand-typed, so the
@@ -88,7 +120,7 @@ SWAP_SUMMARY_CSV_PATH: Path = RESULTS_DIR / "swap_test_summary.csv"
 #: produced under. Committed with the results so a reader can verify the data
 #: analysed is the data shipped, rather than having to take it on trust.
 MANIFEST_PATH: Path = RESULTS_DIR / "manifest.json"
-ARM_OUTPUTS_PATH: Path = RESULTS_DIR / "arm_outputs.json"
+ARM_OUTPUTS_PATH: Path = _result("arm_outputs.json")
 ADAPTERS_DIR: Path = RESULTS_DIR / "adapters"
 FIGURES_DIR: Path = RESULTS_DIR / "figures"
 
@@ -379,7 +411,11 @@ HOLDOUT_FRACTION: float = 0.25
 #: tokeniser. A pair that exceeds it is DROPPED, never truncated: truncating
 #: would let the grounding checker match a quote against text the model never
 #: saw, silently inflating every grounding number.
-MAX_SEQ_LEN: int = 512 if SMOKE else 2048
+#: gpt2's context is 1,024 tokens, and SMOKE uses all of it. An earlier 512
+#: left only 96 tokens for a poem after the prompt template, so EVERY real poem
+#: was dropped and the smoke run trained on an empty dataset — which is exactly
+#: the class of bug SMOKE exists to catch, found by running it.
+MAX_SEQ_LEN: int = 1024 if SMOKE else 2048
 
 #: Tokens occupied by the prompt template plus a maximum-length interpretation,
 #: measured with the real tokeniser. Kept as a constant so importing config
@@ -522,23 +558,124 @@ N_FEWSHOT: int = 3
 # Training
 # ---------------------------------------------------------------------------
 
-LORA_TARGET_MODULES: tuple[str, ...] = ("q_proj", "k_proj", "v_proj")
+#: Every linear layer, attention AND MLP. The MLP is ~88% of each layer and is
+#: where associative knowledge generally sits, so adapting only attention would
+#: risk confirming H2/H3 by construction — the hypotheses predict that weight
+#: updates do not improve grounding, and never touching the part of the network
+#: where grounding would live is not a fair test of that.
+#:
+#: Costs 4.4M trainable parameters (0.89% of the model) against 737k for
+#: attention alone. Still an 8 MB adapter that commits to git.
+#:
+#: gpt2 under SMOKE has a different architecture — one fused ``c_attn`` instead
+#: of separate projections — so the names must differ or peft matches nothing
+#: and silently trains zero parameters.
+LORA_TARGET_MODULES: tuple[str, ...] = ("c_attn",) if SMOKE else (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+)
 LORA_RANK: int = 8
-LORA_ALPHA: int = 16
+
+#: LoRA scales its update by ``alpha / r``. Fixing alpha while sweeping rank
+#: would vary the scaling 4x -> 2x -> 1x across {4, 8, 16}, so the rank axis
+#: would measure capacity AND effective step size together — and the Hu et al.
+#: saturation comparison would be uninterpretable. Deriving alpha from r keeps
+#: the scaling constant at 2, leaving rank as the only thing that changes.
+LORA_ALPHA_MULTIPLIER: int = 2
+
+
+def lora_alpha(rank: int = LORA_RANK) -> int:
+    """Alpha for a given rank, holding the alpha/r scaling constant."""
+    return LORA_ALPHA_MULTIPLIER * rank
+
+
+LORA_ALPHA: int = lora_alpha(LORA_RANK)
 LORA_DROPOUT: float = 0.05
 
 LEARNING_RATE: float = 2e-4
 WEIGHT_DECAY: float = 0.01
-BATCH_SIZE: int = 1 if SMOKE else 8
-GRAD_ACCUM_STEPS: int = 1 if SMOKE else 2
+#: 4 x 4 rather than 8 x 2 — identical effective batch, half the peak
+#: activation memory. Attention is quadratic in sequence length, and it is the
+#: LONGEST batch that runs out of memory, not the median: the p99 training pair
+#: is ~1,800 tokens, so batches near the cap do occur. At the 2048 cap the
+#: attention matrix is ~0.88 GB per layer at batch 8 and ~0.44 GB at batch 4.
+#: Gradient accumulation makes the update identical either way, so the smaller
+#: micro-batch buys headroom for nothing.
+BATCH_SIZE: int = 1 if SMOKE else 4
+GRAD_ACCUM_STEPS: int = 1 if SMOKE else 4
 
-#: Fixed STEP budget, not epochs. With a 2000-poem corpus, fixed epochs would
-#: make every run 2.5x longer and push the sweep past the 30 GPU-hour weekly
-#: budget. It also removes a confound: at fixed epochs the 2000-poem sweep
-#: point would get 2.5x the gradient updates of the 200-poem point, so the
-#: data-size axis would measure compute as much as data.
+#: The budget: an epoch ceiling, converted to steps per run, clamped, and cut
+#: short by early stopping. See MAX_EPOCHS below for why neither a fixed step
+#: count nor a fixed epoch count works alone.
+#: Budget expressed in EPOCHS, converted to steps per run because the step
+#: count depends on how many examples that run trains on. A ceiling, not a
+#: target: early stopping ends most runs sooner.
+#:
+#: Nine passes is where the full corpus sat under the previous fixed-step
+#: budget, kept because nothing observed yet argues against it — and the
+#: validation curve now decides when a run actually stops.
+MAX_EPOCHS: int = 1 if SMOKE else 9
+
+#: Floor on optimisation steps, which matters for the small data-size points.
+#: Nine epochs of 200 poems is ~113 steps and 10% of that is a warmup barely
+#: long enough to reach the target learning rate; a run that short would be
+#: undertrained rather than data-limited, and the data-size curve would measure
+#: the wrong thing.
+MIN_TRAIN_STEPS: int = 2 if SMOKE else 200
+
+#: Hard ceiling regardless of dataset size, so one run cannot consume a session.
 MAX_STEPS: int = 5 if SMOKE else 1000
-WARMUP_STEPS: int = 2 if SMOKE else 100
+
+
+def steps_for(n_examples: int, epochs: int | None = None) -> int:
+    """Optimisation steps covering ``epochs`` passes, clamped to the bounds.
+
+    Expressed here rather than at the call site so every run — sweep, fold,
+    smoke — derives its budget the same way, and so the epoch count is a
+    property of the configuration rather than of whoever launched the run.
+    """
+    import math
+
+    per_epoch = max(1, n_examples // (BATCH_SIZE * GRAD_ACCUM_STEPS))
+    raw = math.ceil((MAX_EPOCHS if epochs is None else epochs) * per_epoch)
+    return max(MIN_TRAIN_STEPS, min(MAX_STEPS, raw))
+
+#: Clamp on the loss before exponentiating it into a perplexity. `exp` diverges
+#: fast, so a diverged run would otherwise write an unusable number into
+#: runs.csv or overflow outright. 20 is far above anything meaningful: uniform
+#: probability over Qwen's 151,936-token vocabulary — a model that has learned
+#: nothing at all — gives log(151936) = 11.93.
+MAX_LOG_PERPLEXITY: float = 20.0
+
+#: Warmup as a FRACTION of the run, not a fixed count. 100 steps is 10% of a
+#: 1000-step run but 30% of a 330-step one, so a constant silently changes
+#: meaning whenever the budget moves.
+WARMUP_RATIO: float = 0.10
+WARMUP_STEPS: int = max(1, int(MAX_STEPS * WARMUP_RATIO))
+
+#: Early stopping is ON everywhere. With an epoch-based ceiling the question
+#: "did this configuration overfit?" is answered per run by its own validation
+#: curve, which is both the honest budget for a hyperparameter search — each
+#: config compared at ITS best, not at an arbitrary shared step count — and the
+#: only thing that keeps the small data-size points from training to 80 epochs.
+#:
+#: The consequence is that runs no longer share a step count. That is the right
+#: trade: comparing under-trained against over-trained at equal compute is not
+#: a fairer comparison, only a more uniform one.
+#: Hard ceiling on the author-grouped validation slice. Authors are held back in
+#: whole blocks, so aiming at 10% can overshoot when one author holds a large
+#: share — on a small fold that produced more validation than training, which is
+#: silent: the run completes, having trained on almost nothing.
+VALIDATION_MAX_FRACTION: float = 0.20
+
+EARLY_STOPPING: bool = True
+EARLY_STOPPING_PATIENCE: int = 3
+
+#: Restore the weights from the best validation step rather than the last.
+#: Without this, early stopping SAVES the overfitted model it stopped because
+#: of — the run ends `patience` evaluations past its own best.
+RESTORE_BEST_WEIGHTS: bool = True
+EVAL_EVERY_STEPS: int = 1 if SMOKE else 50
 LR_SCHEDULE: str = "cosine"
 
 #: Label id for positions excluded from the loss. Loss is masked to
@@ -548,20 +685,56 @@ IGNORE_INDEX: int = -100
 CHECKPOINT_EVERY_STEPS: int = 250
 
 #: Sweep axes, varied ONE AT A TIME with the others at the defaults above.
-#: Not a full grid. DATA_SIZE_SWEEP deliberately straddles LIMA's 1,000-example
-#: threshold so the curve can be compared against Zhou et al. 2023.
+#: Not a full grid: rank and learning rate are swept as a product because they
+#: interact, while data size and masking are single-axis because neither is a
+#: hyperparameter being tuned.
 RANK_SWEEP: tuple[int, ...] = (4, 8, 16)
 LR_SWEEP: tuple[float, ...] = (1e-4, 2e-4, 5e-4)
 
-#: ``None`` is the full surviving corpus, whatever size that turns out to be.
-#: The finite points straddle LIMA's 1,000-example threshold (Zhou et al. 2023)
-#: so the saturation curve can be compared against theirs.
+#: How much training data changes what fine-tuning achieves. ``None`` is the
+#: full surviving corpus, whatever size that turns out to be.
+#:
+#: This axis is not hyperparameter tuning — the final runs use all the data
+#: regardless. It exists because "does more data improve GROUNDING, or only
+#: format?" is one of the fine-tuning capability questions the project is about,
+#: and the answer is a curve rather than a number. Format compliance and the
+#: grounding gap can flatten at different points, and that divergence is the
+#: finding.
+#:
+#: The points happen to straddle LIMA's 1,000-example threshold, which gives
+#: Zhou et al. 2023 as a reference line when reading where the curve flattens.
+#: That is a comparison the design pays for anyway, not the reason the axis
+#: exists.
 DATA_SIZE_SWEEP: tuple[int | None, ...] = (200, 500, 1000, None)
 MASKING_SWEEP: tuple[str, ...] = ("masked", "unmasked")
 
 #: Adapter ranks used by the final evaluated arms.
 ARM_RANKS: dict[str, int] = {"lora_r8": 8, "lora_r16": 16}
 
+#: The fold whose partition every single-split run uses — the sweep, and
+#: lora_r16. Fixed so the rank comparison stays like-for-like: fold-N r8 against
+#: fold-N r16, never fold-averaged r8 against a single-split r16.
+#:
+#: The consequence is that lora_r16 can only legitimately generate for the ~30
+#: evaluation poems this fold held out. Its confidence interval is therefore
+#: visibly wider than every other arm's, and that is a property of the design
+#: rather than noise.
+SINGLE_SPLIT_FOLD: int = 0
+
+#: How the sweep picks a winner. Fixed HERE, before any sweep run, because
+#: choosing the criterion after seeing results is the researcher freedom the
+#: pre-registration exists to remove — and with 13 runs there is always a metric
+#: under which some config looks best.
+#:
+#: Validation loss, lowest wins. Ties broken by FEWER trainable parameters, so a
+#: config that matches another's loss with less capacity is preferred — which is
+#: also the direction Hu et al.'s saturation finding predicts.
+#:
+#: Note what this is NOT: judge scores never select a config. They are the
+#: outcome measure, and selecting on them would fit the hyperparameters to the
+#: thing being reported.
+SWEEP_SELECTION_METRIC: str = "final_val_loss"
+SWEEP_SELECTION_LOWER_IS_BETTER: bool = True
 
 # ---------------------------------------------------------------------------
 # Generation
@@ -733,6 +906,38 @@ CONTAMINATION_MATCH_THRESHOLD: float = 0.8
 #: would let a memorised poem fail the probe by chance, understating
 #: contamination. This is the one place decoding deliberately differs.
 CONTAMINATION_TEMPERATURE: float = 0.0
+
+#: Tokens generated per probe. Sized against CONTAMINATION_SCORED_LINES, not
+#: against whole poems: emitting the scored window costs 79 tokens at the 95th
+#: percentile and 134 at the worst case, so this leaves roughly 2-3x headroom
+#: for a model that drifts before recovering the text.
+CONTAMINATION_MAX_NEW_TOKENS: int = 256
+
+#: Lines shorter than this are ignored when scoring recall. "And" or "O!" turn
+#: up in almost any continuation by chance, and counting them would push every
+#: poem's score toward the memorisation threshold.
+CONTAMINATION_MIN_LINE_WORDS: int = 3
+
+#: How many of a poem's remaining lines recall is scored over. A FIXED window,
+#: not the whole poem, and the reason is a measurement bug this replaces.
+#:
+#: Scoring the whole remainder against a fixed token budget made the threshold
+#: mechanically unreachable for long poems: at 256 tokens, 26.8% of the corpus
+#: could not have scored 0.8 however perfectly the model recited — 100% of
+#: poems under 20 lines were reachable against 0.3% of those over 60. The
+#: `memorised` flag would then have meant "memorised AND short", and since that
+#: flag stratifies every headline result, the non-memorised stratum would have
+#: been quietly full of long poems the probe never gave room to.
+#:
+#: A fixed window asks every poem the same question — "recite the next six
+#: lines" — so the flag means one thing corpus-wide. Six because the corpus
+#: floor is 8 lines and the prompt takes 2, so only 0.5% of poems have fewer.
+CONTAMINATION_SCORED_LINES: int = 6
+
+#: Per-poem probe results. Committed: the memorised flag stratifies every
+#: headline result, so a reader checking the stratification needs the flags,
+#: not just the summary.
+CONTAMINATION_PATH: Path = _result("contamination.jsonl")
 
 BOOTSTRAP_ITERATIONS: int = 100 if SMOKE else 10_000
 CONFIDENCE_LEVEL: float = 0.95

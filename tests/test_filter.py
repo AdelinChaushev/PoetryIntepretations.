@@ -62,10 +62,15 @@ def test_every_stage_appears_even_when_it_drops_nothing():
     )
     names = [stage.name for stage in funnel]
 
-    assert names == [
-        "fetched", "length bounds", "has interpretation",
-        "schema followed", "word bounds", "quotes grounded",
-    ]
+    expected = ["fetched", "length bounds", "has interpretation",
+                "schema followed", "word bounds", "quotes grounded"]
+    # SMOKE sets N_POEMS, which adds a cap stage. The stage genuinely exists in
+    # that mode, so the expectation depends on the config rather than on which
+    # mode the suite happened to be run in.
+    if config.N_POEMS is not None:
+        expected.append("corpus cap")
+
+    assert names == expected
 
 
 def test_poem_outside_length_bounds_is_dropped():
@@ -219,11 +224,19 @@ def test_length_bound_rejects_on_tokens_not_lines():
     This is the whole reason the line cap was removed: line count was rejecting
     on the wrong variable and discarding ~4% of usable poems.
     """
+    # Sized RELATIVE to the budget, not to a number that happens to suit the
+    # full-mode config. SMOKE shrinks MAX_POEM_TOKENS from 1632 to 96, and a
+    # fixture with hardcoded lengths tests nothing there.
+    budget = config.MAX_POEM_TOKENS
     many_short_lines = {"poem_id": "a", "title": "t", "author": "x",
-                        "lines": ["oh"] * 180, "linecount": 180}
+                        "lines": ["oh"] * (budget // 4),
+                        "linecount": budget // 4}
     few_long_lines = {"poem_id": "b", "title": "t", "author": "x",
-                      "lines": ["word " * 400] * 12, "linecount": 12}
+                      "lines": ["word " * budget] * 12, "linecount": 12}
 
+    assert many_short_lines["linecount"] > few_long_lines["linecount"], (
+        "the fixture must have MORE lines in the accepted poem, or it does not "
+        "demonstrate that rejection is on tokens rather than lines")
     assert data_filter.within_length_bounds(many_short_lines)
     assert not data_filter.within_length_bounds(few_long_lines)
 
