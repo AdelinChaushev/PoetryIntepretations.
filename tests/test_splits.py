@@ -412,3 +412,56 @@ def test_no_fold_trains_on_its_own_evaluation_poems():
     for fold in range(config.N_FOLDS):
         trained = {p["poem_id"] for p in splits.training_partition(pairs, fold)}
         assert not trained & {i for i, f in evaluation.items() if f == fold}
+
+
+# --- the artifacts are present, and say so when they are not -------------------
+
+def test_require_artifacts_passes_when_both_files_exist():
+    import config
+    from src.data import splits
+
+    if config.TRAINING_PAIRS_PATH.exists() and config.FOLD_ASSIGNMENT_PATH.exists():
+        splits.require_artifacts()          # must not raise
+
+
+def test_require_artifacts_names_the_directory_to_use(tmp_path, monkeypatch):
+    """The loaders return [] and {} for a missing file, so a wrong data dir on
+    Kaggle produces zero pairs and an empty assignment and fails much later,
+    for a reason that looks unrelated. The fix is one line — but only if the
+    error says which line."""
+    import config
+    from src.data import splits
+
+    monkeypatch.setattr(config, "TRAINING_PAIRS_PATH",
+                        tmp_path / "training_pairs.jsonl")
+    monkeypatch.setattr(config, "FOLD_ASSIGNMENT_PATH", tmp_path / "folds.json")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    try:
+        splits.require_artifacts()
+    except FileNotFoundError as error:
+        text = str(error)
+        assert "training_pairs.jsonl" in text and "folds.json" in text
+        assert "POETRY_DATA_DIR" in text
+        return
+    raise AssertionError("a missing corpus was accepted")
+
+
+def test_require_artifacts_reports_a_partial_upload(tmp_path, monkeypatch):
+    """Shipping one of the two is the likelier mistake, and the one the
+    'written by a single save() call' rule exists to prevent."""
+    import config
+    from src.data import splits
+
+    (tmp_path / "folds.json").write_text("{}")
+    monkeypatch.setattr(config, "TRAINING_PAIRS_PATH",
+                        tmp_path / "training_pairs.jsonl")
+    monkeypatch.setattr(config, "FOLD_ASSIGNMENT_PATH", tmp_path / "folds.json")
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+
+    try:
+        splits.require_artifacts()
+    except FileNotFoundError as error:
+        assert "training_pairs.jsonl" in str(error)
+        return
+    raise AssertionError("a half-shipped pair of artifacts was accepted")

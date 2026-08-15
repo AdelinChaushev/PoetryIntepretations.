@@ -38,6 +38,7 @@ import json
 import logging
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 import config
 
@@ -377,6 +378,51 @@ def load_assignment() -> dict:
         return {}
     saved = json.loads(path.read_text(encoding="utf-8"))
     return {int(k): v for k, v in saved.get("fold_of", {}).items()}
+
+
+def require_artifacts() -> None:
+    """Fail loudly, and usefully, when the shipped artifacts are not present.
+
+    The loaders return ``[]`` and ``{}`` for a missing file, deliberately — the
+    test suite runs without data. On Kaggle that leniency is a trap: a wrong
+    ``POETRY_DATA_DIR`` gives zero pairs and an empty assignment, and the run
+    proceeds until something much later fails for a reason that looks unrelated.
+
+    So the notebook asserts the precondition explicitly, and when it fails this
+    searches the mounted inputs for the two files and reports the directory to
+    set — the fix is one line, but only if you know which line.
+    """
+    missing = [p for p in (config.TRAINING_PAIRS_PATH,
+                           config.FOLD_ASSIGNMENT_PATH) if not p.exists()]
+    if not missing:
+        return
+
+    wanted = {config.TRAINING_PAIRS_PATH.name, config.FOLD_ASSIGNMENT_PATH.name}
+    roots = [Path("/kaggle/input")] if Path("/kaggle/input").is_dir() else []
+    roots.append(config.PROJECT_ROOT)
+
+    found: dict = {}
+    for root in roots:
+        for path in root.rglob("*"):
+            if path.name in wanted and path.is_file():
+                found.setdefault(path.parent, set()).add(path.name)
+
+    complete = [d for d, names in found.items() if names == wanted]
+    lines = [f"missing: {', '.join(str(p) for p in missing)}",
+             f"POETRY_DATA_DIR is currently {config.DATA_DIR}"]
+    if complete:
+        lines.append(f"\nboth files are here — set POETRY_DATA_DIR to:\n"
+                     f"    {complete[0]}")
+    elif found:
+        lines.append("\nfound only partially:")
+        lines += [f"    {d}  ({', '.join(sorted(n))})" for d, n in found.items()]
+    elif roots and roots[0].name == "input":
+        available = sorted(p.name for p in roots[0].iterdir())
+        lines.append(f"\nnothing found. Mounted inputs: "
+                     f"{', '.join(available) or '(none)'}")
+        lines.append("Attach the dataset holding training_pairs.jsonl and "
+                     "folds.json, then set POETRY_DATA_DIR to its directory.")
+    raise FileNotFoundError("\n".join(lines))
 
 
 def load_evaluation_folds() -> dict:
