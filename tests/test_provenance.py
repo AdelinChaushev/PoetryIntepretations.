@@ -249,3 +249,13 @@ def test_the_kaggle_cell_reclones_rather_than_skipping():
     assert "not CHECKOUT.exists()" not in cell
     # The commit must be printed, so the log says which code produced the run.
     assert "rev-parse" in cell
+
+    # Re-cloning the FILES is not enough. A module already in sys.modules keeps
+    # being served from the previous checkout, so a freshly pulled fix presents
+    # as "module has no attribute ..." -- which reads as a missing push rather
+    # than a stale import. Re-running without restarting the kernel is the
+    # normal case on Kaggle, so the purge is required, not defensive.
+    assert "sys.modules" in cell and "invalidate_caches" in cell, (
+        "re-cloned files will be shadowed by already-imported modules")
+    assert cell.index("del sys.modules") < cell.index("import config"), (
+        "stale modules are purged after config is imported, which is too late")

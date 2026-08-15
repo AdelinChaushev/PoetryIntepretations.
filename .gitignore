@@ -25,6 +25,17 @@ data/*
 !data/interpretations.jsonl
 !data/raw_poems.jsonl
 !data/folds.json
+# training_pairs.jsonl (6.2 MB) is derived from the two above, so it looks
+# redundant — but it is the file Kaggle trains on, and CLAUDE.md forbids
+# rebuilding it there: the funnel is a pure function of the raw files AND the
+# thresholds, so a threshold changed after the folds were written would have the
+# GPU side training on a different set of poems than the assignment describes,
+# with nothing raising.
+#
+# It must also travel WITH folds.json, which is already committed. Shipping one
+# without the other is precisely the "stale half" the single-save rule exists to
+# prevent, and it is what left Kaggle with an assignment and no corpus.
+!data/training_pairs.jsonl
 data/*.bak
 data/*.pre-retry.*
 
