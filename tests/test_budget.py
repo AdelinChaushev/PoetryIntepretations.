@@ -116,12 +116,15 @@ def test_masking_is_delegated_to_the_library():
     """SFTTrainer masks the prompt for a prompt-completion dataset. Two earlier
     versions of this module hand-rolled first the loop and then the labels; the
     loop version shipped a bug that silently disabled early stopping across a
-    whole sweep."""
+    whole sweep.
+
+    Matches the assignment, not the literal `=True`: the value is now derived
+    from the `masking` override so the sweep's unmasked run trains unmasked."""
     import inspect
     from src.train import loop
 
     source = inspect.getsource(loop.training_arguments)
-    assert "completion_only_loss=True" in source
+    assert "completion_only_loss=" in source
     assert "from trl import SFTConfig" in inspect.getsource(loop.training_arguments)
 
 
@@ -232,3 +235,55 @@ def test_training_refuses_to_run_on_cpu_outside_smoke():
 
     source = inspect.getsource(loop.train)
     assert "torch.cuda.is_available() or config.SMOKE" in source
+
+
+# --- backfilling a column onto an existing run --------------------------------
+
+def test_update_run_rewrites_a_single_row(tmp_path, monkeypatch):
+    import csv
+
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+    loop.append_run({"run": "a", "final_val_loss": 2.0})
+    loop.append_run({"run": "b", "final_val_loss": 1.5})
+
+    assert loop.update_run("b", heldout_perplexity=4.2) is True
+    rows = {r["run"]: r for r in csv.DictReader(path.open())}
+    assert rows["b"]["heldout_perplexity"] == "4.2"
+    assert rows["a"]["heldout_perplexity"] == ""      # untouched, not dropped
+    assert rows["a"]["final_val_loss"] == "2.0"
+
+
+def test_update_run_reports_a_miss(tmp_path, monkeypatch):
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+    loop.append_run({"run": "a", "final_val_loss": 2.0})
+    assert loop.update_run("nonexistent", x=1) is False
+
+
+def test_backfill_skips_rows_that_already_have_the_metric(tmp_path, monkeypatch):
+    """Recomputing would load a model for nothing, and on Kaggle that is GPU
+    time spent reproducing a number already on disk."""
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+    loop.append_run({"run": "a", "fold": 0, "adapter": "/nope",
+                     "heldout_perplexity": 5.0})
+    assert loop.backfill_heldout_perplexity([], None) == []
+
+
+def test_backfill_skips_rows_with_no_adapter_on_disk(tmp_path, monkeypatch):
+    """Sweep runs deliberately keep no adapter, so most rows cannot be
+    backfilled and must be passed over rather than raising."""
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+    loop.append_run({"run": "sweep_r8_lr0.0002", "fold": "", "adapter": "",
+                     "heldout_perplexity": ""})
+    assert loop.backfill_heldout_perplexity([], None) == []

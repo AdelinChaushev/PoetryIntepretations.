@@ -159,12 +159,18 @@ def training_arguments(run_name: str, steps: int, output_dir, **overrides):
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         save_total_limit=2,
-        # THE masking setting. With a prompt-completion dataset this supervises
+        # THE masking setting. With a prompt-completion dataset, True supervises
         # the completion only, so the poem is read but never scored. Stated
         # explicitly rather than left to the default, which infers it from the
         # dataset shape — an inferred behaviour is one a schema change could
         # silently flip.
-        completion_only_loss=True,
+        #
+        # Driven by the `masking` override so the sweep's unmasked run actually
+        # trains unmasked. It previously did not: the spec carried
+        # masking="unmasked", run_name labelled the row `_unmasked`, and this
+        # line hardcoded True — so the run trained masked and the report would
+        # have shown a masking comparison in which nothing varied.
+        completion_only_loss=overrides.get("masking", "masked") == "masked",
         # Nothing reaches here that does not already fit: dataset.build_dataset
         # DROPS over-long pairs rather than letting them be truncated, because a
         # truncated poem is still scored against its full text by the grounding
@@ -178,10 +184,151 @@ def training_arguments(run_name: str, steps: int, output_dir, **overrides):
     )
 
 
+def heldout_examples(pairs: list[dict], fold: int, tokenizer) -> list[dict]:
+    """The poems ``fold`` holds out, as training-shaped examples.
+
+    Used for a perplexity that model selection never touched. Not the same set
+    as the validation slice, and deliberately so — see :func:`train`.
+    """
+    from src.data import splits
+
+    mapping = splits.load_assignment()
+    held = [pair for pair in pairs if mapping.get(pair["poem_id"]) == fold]
+    return dataset.build_dataset(held, tokenizer)
+
+
+def evaluate_perplexity(model, tokenizer, examples: list[dict],
+                        label: str = "eval",
+                        max_length: int | None = None) -> dict:
+    """Masked cross-entropy and perplexity of ``model`` on ``examples``.
+
+    A forward pass only — no gradients, no optimizer, nothing written. Shared by
+    the held-out measurement inside :func:`train` and by
+    :func:`base_perplexity`, so an adapted model and the base model are always
+    scored by the same code on the same masking.
+
+    **Its own config, not ``training_arguments``.** Two settings must differ.
+    ``max_length`` defaults to ``GEN_MAX_CONTEXT`` rather than ``MAX_SEQ_LEN``,
+    because ``base_few``'s sequences carry three exemplars and reach ~3,900
+    tokens — inheriting the training cap would truncate away the target poem and
+    report the perplexity of an interpretation of a poem the model never saw.
+    And the batch is 1: sequences twice training's length would otherwise
+    multiply the quadratic attention term for no benefit, since nothing here is
+    being optimised.
+    """
+    import tempfile
+
+    from datasets import Dataset
+    from trl import SFTConfig, SFTTrainer
+
+    from src.model import setup
+
+    if not examples:
+        return {"loss": float("nan"), "perplexity": float("nan"), "n": 0}
+
+    limit = config.GEN_MAX_CONTEXT if max_length is None else max_length
+    too_long = [e for e in examples
+                if dataset.token_length(e, tokenizer) + 1 > limit]
+    assert not too_long, (
+        f"{len(too_long)} of {len(examples)} examples exceed {limit} tokens and "
+        f"would be TRUNCATED, which for base_few removes the target poem. Raise "
+        f"the limit rather than measuring a truncated sequence.")
+
+    bf16 = setup.supports_bf16()
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = SFTTrainer(
+            model=model,
+            args=SFTConfig(output_dir=tmp, report_to=[], eval_strategy="no",
+                           completion_only_loss=True, max_length=limit,
+                           per_device_eval_batch_size=1,
+                           per_device_train_batch_size=1, max_steps=1,
+                           bf16=bf16,
+                           fp16=not bf16 and setup.device() == "cuda",
+                           seed=config.SEED),
+            train_dataset=Dataset.from_list(examples[:1]),
+            eval_dataset=Dataset.from_list(examples),
+            processing_class=tokenizer,
+        )
+        metrics = trainer.evaluate()
+
+    loss = metrics["eval_loss"]
+    return {"loss": loss, "perplexity": perplexity(loss), "n": len(examples)}
+
+
+def few_shot_examples(pairs: list[dict], fold: int, tokenizer,
+                      exemplars: list[dict]) -> list[dict]:
+    """Held-out examples under ``base_few``'s own prompt.
+
+    ``base_few`` differs from ``base_zero`` only in what precedes the poem, so
+    measuring both under the zero-shot prompt would give them an identical
+    perplexity and make them indistinguishable to H4 by construction. Scored in
+    the context the arm actually generates in instead.
+    """
+    from src.data import splits
+    from src.generate import inference
+
+    mapping = splits.load_assignment()
+    return [{"prompt": inference.build_prompt(pair, "base_few", exemplars),
+             "completion": pair["interpretation"],
+             "poem_id": pair["poem_id"]}
+            for pair in pairs if mapping.get(pair["poem_id"]) == fold]
+
+
+def base_perplexity(pairs: list[dict], model, tokenizer,
+                    exemplars: list[dict] | None = None) -> dict:
+    """The BASE model's held-out perplexity, per arm and per fold.
+
+    ``base_zero`` and ``base_few`` need a perplexity for H4, and the base model
+    has no held-out fold of its own — it never trained, so no poem is off-limits
+    to it. That freedom is the problem: measured on a different set from the
+    LoRA arms, the number would not be comparable, and H4 correlates perplexity
+    against judge score **across arms**.
+
+    So it is measured on exactly the folds the adapters are measured on, and
+    each arm is measured **under its own prompt**. Same weights, different
+    context: without that, the two base arms would return the same number and
+    H4 would be comparing a tie it created itself.
+
+    Must run on Kaggle, in the same session: it needs the base model, and only
+    adapters come down.
+    """
+    arms = {"base_zero": lambda fold: heldout_examples(pairs, fold, tokenizer)}
+    if exemplars:
+        arms["base_few"] = lambda fold: few_shot_examples(pairs, fold,
+                                                          tokenizer, exemplars)
+
+    result: dict = {}
+    for arm, build in arms.items():
+        per_fold = {}
+        for fold in range(config.N_FOLDS):
+            examples = build(fold)
+            per_fold[fold] = evaluate_perplexity(
+                model, tokenizer, examples, label=f"{arm}_fold{fold}")
+            log.info("%s, fold %d held out: perplexity %.3f over %d examples",
+                     arm, fold, per_fold[fold]["perplexity"], per_fold[fold]["n"])
+
+        losses = [m["loss"] for m in per_fold.values() if m["n"]]
+        pooled = sum(losses) / len(losses) if losses else float("nan")
+        result[arm] = {"per_fold": per_fold, "mean_loss": pooled,
+                       "mean_perplexity": perplexity(pooled) if losses
+                                          else float("nan")}
+
+    # Both arms must cover the same poems, or the comparison is between
+    # different data rather than between different prompts.
+    if len(result) > 1:
+        counts = {arm: [m["n"] for m in r["per_fold"].values()]
+                  for arm, r in result.items()}
+        assert len(set(map(tuple, counts.values()))) == 1, (
+            f"the base arms cover different poems per fold: {counts}. One "
+            f"prompt is dropping examples the other keeps, so the perplexities "
+            f"are not comparable.")
+    return result
+
+
 def train(model, tokenizer, examples: list[dict], pairs: list[dict],
           run_name: str, max_steps: int | None = None,
           early_stopping: bool | None = None, fold: int | None = None,
-          **overrides) -> dict:
+          save_adapter: bool = True, **overrides) -> dict:
     """Train one adapter. Returns the run record written to ``runs.csv``.
 
     Pass ``fold`` to have the adapter written here, in the same call that
@@ -194,6 +341,20 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
     rather than the ones the run stopped on. Verified rather than assumed: the
     written adapter is byte-identical to the best checkpoint and differs from
     the last.
+
+    ``save_adapter=False`` for sweep runs. Nine grid points at three ranks would
+    otherwise collide — every rank-8 configuration writes to the same
+    ``adapter_dir(8, fold)``, so the last one silently overwrites the rest and
+    the surviving adapter belongs to no recorded run in particular.
+
+    **Two perplexities are recorded, and the difference between them matters.**
+    ``val_perplexity`` comes from the validation slice, which early stopping
+    *selected on* — the run chose its stopping point by minimising exactly that
+    number, so it is optimistic. ``heldout_perplexity`` comes from the fold this
+    run never saw at all. H4 should use the second: it correlates perplexity
+    against judge score across arms, and the base arms' perplexity was never
+    selected on, so using the selected-on number for the LoRA arms alone would
+    bias the comparison in their favour.
     """
     from datasets import Dataset
     from transformers import EarlyStoppingCallback
@@ -288,9 +449,27 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         "smoke": config.SMOKE,
         "fold": fold,
         "adapter": None,
+        "heldout_loss": None,
+        "heldout_perplexity": None,
+        "n_heldout": 0,
     }
 
     if fold is not None:
+        # The perplexity model selection never touched. Measured AFTER
+        # load_best_model_at_end has restored the best weights, so it describes
+        # the adapter that actually ships rather than the one the run stopped on.
+        held = heldout_examples(pairs, fold, tokenizer)
+        metrics = evaluate_perplexity(trainer.model, tokenizer, held,
+                                      label=f"{run_name}_heldout")
+        record.update(heldout_loss=metrics["loss"],
+                      heldout_perplexity=metrics["perplexity"],
+                      n_heldout=metrics["n"])
+        log.info("fold %d held out: perplexity %.3f over %d examples "
+                 "(validation said %.3f, but selection chose on it)",
+                 fold, metrics["perplexity"], metrics["n"],
+                 record["val_perplexity"])
+
+    if fold is not None and save_adapter:
         from src.model import setup
 
         # trainer.model IS the object passed in, and load_best_model_at_end has
@@ -302,6 +481,95 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
 
     append_run(record)
     return record
+
+
+def update_run(run_name: str, **fields) -> bool:
+    """Rewrite one recorded run's fields in place. Returns whether it matched.
+
+    ``append_run`` only appends, which is right for a live run — a session that
+    dies mid-sweep must not take earlier rows with it. Backfilling a column is
+    the one case that genuinely needs a rewrite, and doing it through the same
+    header reconciliation keeps the file consistent either way.
+    """
+    import csv
+
+    path = Path(config.RUNS_CSV_PATH)
+    if not path.exists():
+        return False
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        header, rows = list(reader.fieldnames or []), list(reader)
+
+    matched = False
+    for row in rows:
+        if row.get("run") == run_name:
+            row.update({k: v for k, v in fields.items()})
+            matched = True
+    if not matched:
+        return False
+
+    fields_out = header + [f for f in fields if f not in header]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields_out,
+                                extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({f: row.get(f, "") for f in fields_out})
+    log.info("updated %s in %s", run_name, path.name)
+    return True
+
+
+def backfill_heldout_perplexity(pairs: list[dict], tokenizer) -> list[dict]:
+    """Compute ``heldout_perplexity`` for recorded runs that lack it.
+
+    **Much cheaper than re-running, and more faithful.** The adapter is already
+    on disk and the fold it held out is already in the row, so this is one
+    forward pass over ~500 poems rather than a whole training run. It also
+    measures the weights that actually shipped, where a retrain would produce a
+    *different* adapter — same configuration, but GPU non-determinism means not
+    the same numbers.
+
+    Exists because the day-3 pilot predates the column: it is a valid fold-0
+    run at the default configuration, missing only this measurement.
+    """
+    import csv
+
+    from src.model import setup
+
+    path = Path(config.RUNS_CSV_PATH)
+    if not path.exists():
+        return []
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    filled = []
+    for row in rows:
+        if row.get("heldout_perplexity") not in (None, "", "None"):
+            continue
+        adapter, fold = row.get("adapter"), row.get("fold")
+        if not adapter or fold in (None, "", "None"):
+            continue
+        if not Path(adapter).exists():
+            log.warning("%s records adapter %s but it is not on disk",
+                        row["run"], adapter)
+            continue
+
+        model = setup.load_adapter(adapter)
+        held = heldout_examples(pairs, int(fold), tokenizer)
+        metrics = evaluate_perplexity(model, tokenizer, held,
+                                      label=f"{row['run']}_backfill")
+        update_run(row["run"], heldout_loss=metrics["loss"],
+                   heldout_perplexity=metrics["perplexity"],
+                   n_heldout=metrics["n"])
+        log.info("%s: held-out perplexity %.3f over %d examples",
+                 row["run"], metrics["perplexity"], metrics["n"])
+        filled.append({"run": row["run"], **metrics})
+
+    if not filled:
+        log.info("no runs needed backfilling")
+    return filled
 
 
 def save_history(history: list[dict], run_name: str) -> None:

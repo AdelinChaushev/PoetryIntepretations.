@@ -98,10 +98,22 @@ def generate_one(prompt: str, model, tokenizer) -> str:
     """
     import torch
 
-    encoded = tokenizer(prompt, return_tensors="pt",
-                        truncation=True,
-                        max_length=config.MAX_SEQ_LEN - config.GEN_MAX_NEW_TOKENS
-                        ).to(model.device)
+    # NOT truncated. Truncation here was a silent, arm-specific catastrophe:
+    # `base_few` prepends three exemplars costing 1,898 tokens, so every one of
+    # its prompts overran a MAX_SEQ_LEN-derived cap and was cut from the right —
+    # keeping the worked examples and discarding the poem being interpreted. The
+    # arm then wrote interpretations of poems it had never seen, and nothing
+    # raised. An assertion is the only safe behaviour: a prompt that does not
+    # fit is a bug to fix, never a prompt to shorten.
+    encoded = tokenizer(prompt, return_tensors="pt").to(model.device)
+    length = encoded["input_ids"].shape[1]
+    assert length + config.GEN_MAX_NEW_TOKENS <= config.GEN_MAX_CONTEXT, (
+        f"prompt is {length} tokens and generation needs "
+        f"{config.GEN_MAX_NEW_TOKENS} more, over the {config.GEN_MAX_CONTEXT} "
+        f"context. Truncating would silently drop the end of the prompt — for "
+        f"base_few that is the target poem. Raise GEN_MAX_CONTEXT (the model "
+        f"handles 32,768; this is our limit, not its) or shorten the exemplars.")
+
     torch.manual_seed(config.SEED)
 
     with torch.no_grad():

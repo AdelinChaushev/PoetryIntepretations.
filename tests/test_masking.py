@@ -201,7 +201,12 @@ def test_completion_only_loss_is_set_explicitly():
     import inspect
     from src.train import loop
 
-    assert "completion_only_loss=True" in inspect.getsource(loop.training_arguments)
+    source = inspect.getsource(loop.training_arguments)
+    assert "completion_only_loss=" in source
+    # Derived from the masking override, not hardcoded. Hardcoding it made the
+    # sweep's unmasked run train MASKED while being recorded as `_unmasked` —
+    # a reported comparison in which nothing varied.
+    assert 'overrides.get("masking", "masked") == "masked"' in source
 
 
 # --- the alignment view -------------------------------------------------------
@@ -280,3 +285,147 @@ def test_accumulation_normalises_by_token_count_not_microbatch_count():
             __import__("transformers").AutoConfig.from_pretrained("gpt2")).forward)
     assert ("num_items_in_batch" in forward.parameters
             or "kwargs" in forward.parameters)
+
+
+# --- two perplexities, and the difference between them ------------------------
+
+def test_both_perplexities_are_recorded():
+    """val_perplexity was SELECTED ON — early stopping minimised exactly that
+    number, so it is optimistic. heldout_perplexity comes from the fold the run
+    never saw. H4 needs the second: it correlates perplexity against judge score
+    across arms, and the base arms' perplexity was never selected on, so using
+    the selected-on number for the LoRA arms alone tilts the comparison.
+    """
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.train)
+    assert '"val_perplexity"' in source
+    assert '"heldout_perplexity"' in source
+
+
+def test_heldout_examples_come_from_the_runs_own_fold():
+    """Not a global test set: fold 1's held-out poems were TRAINING data for the
+    fold-0 adapter, so each model can only be scored on its own fold."""
+    import inspect
+
+    from src.train import loop
+
+    assert "mapping.get(pair[\"poem_id\"]) == fold" in inspect.getsource(
+        loop.heldout_examples)
+
+
+def test_heldout_is_measured_after_best_weights_are_restored():
+    """Measured on the adapter that ships, not the one the run stopped on."""
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.train)
+    assert source.index("trainer.train()") < source.index("heldout_examples(")
+
+
+def test_base_perplexity_covers_every_fold():
+    """base_zero and base_few need a number comparable with the LoRA arms, and
+    the base model has no fold of its own — it never trained, so nothing is
+    off-limits. That freedom is the hazard: measured on a different set, the
+    number would not be comparable and H4 compares across arms."""
+    import inspect
+
+    from src.train import loop
+
+    assert "range(config.N_FOLDS)" in inspect.getsource(loop.base_perplexity)
+
+
+def test_empty_examples_do_not_crash_the_evaluator():
+    from src.train import loop
+
+    result = loop.evaluate_perplexity(None, None, [])
+    assert result["n"] == 0 and result["perplexity"] != result["perplexity"]
+
+
+# --- the two base arms are measured under their own prompts -------------------
+
+def test_base_few_is_scored_under_its_own_prompt():
+    """base_zero and base_few share weights and differ only in what precedes
+    the poem. Scoring both under the zero-shot prompt would return an IDENTICAL
+    perplexity and make them indistinguishable to H4 by construction — a tie
+    the measurement created rather than one the models exhibit."""
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.few_shot_examples)
+    assert '"base_few"' in source and "inference.build_prompt" in source
+
+
+def test_the_base_arms_must_cover_the_same_poems():
+    """Different coverage would mean comparing different data rather than
+    different prompts."""
+    import inspect
+
+    from src.train import loop
+
+    assert "not comparable" in inspect.getsource(loop.base_perplexity)
+
+
+def test_perplexity_evaluation_does_not_inherit_the_training_cap():
+    """base_few sequences run past 3,900 tokens. Evaluating them under
+    MAX_SEQ_LEN would truncate away the target poem and report the perplexity
+    of an interpretation of a poem the model never saw."""
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.evaluate_perplexity)
+    assert "config.GEN_MAX_CONTEXT if max_length is None" in source
+
+
+def test_over_long_examples_raise_rather_than_truncate():
+    """Truncation is never the right answer here — it removes the end of the
+    prompt, which for base_few is the poem being interpreted."""
+    from src.train import loop
+
+    long_example = {"prompt": "word " * 20000, "completion": "x", "poem_id": 1}
+    from src.data.filter import get_tokenizer
+
+    try:
+        loop.evaluate_perplexity(None, get_tokenizer(), [long_example])
+    except AssertionError as error:
+        assert "TRUNCATED" in str(error)
+        return
+    raise AssertionError("an over-long example was accepted for evaluation")
+
+
+def test_the_unmasked_sweep_run_actually_trains_unmasked():
+    """The axis was dead. reported_curves emitted masking="unmasked",
+    run_name labelled the row `_unmasked`, and training_arguments hardcoded
+    completion_only_loss=True — so the run trained masked and the report would
+    have carried a masking comparison in which nothing varied.
+    """
+    from src.train import loop
+
+    masked = loop.training_arguments("m", 10, "/tmp/mask_on", masking="masked")
+    unmasked = loop.training_arguments("u", 10, "/tmp/mask_off",
+                                       masking="unmasked")
+    assert masked.completion_only_loss is True
+    assert unmasked.completion_only_loss is False
+
+
+def test_masking_defaults_to_masked():
+    """Every run that does not mention masking must be masked — the sweep has
+    exactly one unmasked point and it says so explicitly."""
+    from src.train import loop
+
+    assert loop.training_arguments("d", 10, "/tmp/mask_default"
+                                   ).completion_only_loss is True
+
+
+def test_run_one_forwards_the_masking_axis():
+    import inspect
+
+    from src.train import sweep
+
+    assert 'masking=spec.get("masking", "masked")' in inspect.getsource(
+        sweep.run_one)

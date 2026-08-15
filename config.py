@@ -771,6 +771,28 @@ GEN_TOP_P: float = 0.9
 GEN_REPETITION_PENALTY: float = 1.2
 GEN_MAX_NEW_TOKENS: int = 400
 
+#: Context available at GENERATION, and deliberately larger than MAX_SEQ_LEN.
+#:
+#: MAX_SEQ_LEN = 2048 is a *training* limit. It exists because attention is
+#: quadratic and, at an effective batch of 16 with activations kept for the
+#: backward pass, a T4 cannot hold more. None of that applies here: generation
+#: runs at batch 1 under no_grad, so the only per-token cost is the KV cache,
+#: which is a few tens of MB at these lengths. Qwen2.5-0.5B itself handles
+#: 32,768 tokens.
+#:
+#: **Sized from the arm that needs it, and the reason is a bug this replaces.**
+#: `base_few` prepends three worked examples, costing 1,898 tokens before the
+#: target poem appears; its prompts run to a median of 2,245 tokens and a
+#: maximum of 3,641. Capped at MAX_SEQ_LEN - GEN_MAX_NEW_TOKENS = 1,648, all 150
+#: were right-truncated -- keeping the exemplars and cutting off the poem being
+#: interpreted. `base_few` would have written interpretations of poems it never
+#: saw, scored near zero on grounding, and made `base_few` vs `lora_r8` -- the
+#: headline contrast -- an artifact of truncation.
+#:
+#: 6144 leaves ~50% headroom over the 4,041 the longest case needs. Identical
+#: for every arm, because a per-arm context limit would be a per-arm handicap.
+GEN_MAX_CONTEXT: int = 6144
+
 #: The ``template`` arm: one fixed generic interpretation emitted for every
 #: poem. The trivial baseline. It may score surprisingly well, which is a
 #: legitimate result rather than a bug — whatever it scores is how much of a

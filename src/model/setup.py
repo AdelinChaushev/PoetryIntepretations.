@@ -193,3 +193,19 @@ def save_adapter(model, path) -> None:
     model.save_pretrained(path)
     size = sum(f.stat().st_size for f in path.glob("*")) / 1024**2
     log.info("adapter written to %s (%.1f MB)", path, size)
+
+
+def load_adapter(path, base=None):
+    """Attach a saved adapter to a base model.
+
+    ``adapter_config.json`` records the base model it was trained against, so
+    the adapter is self-describing and this needs no rank or target list. That
+    is also why merged models are never saved: the base plus these two files
+    reconstructs the model in one line, at 1.5 MB instead of a gigabyte.
+    """
+    from peft import PeftModel
+
+    model = load_base_model() if base is None else base
+    adapted = PeftModel.from_pretrained(model, str(path))
+    log.info("loaded adapter %s onto %s", path, config.MODEL)
+    return adapted

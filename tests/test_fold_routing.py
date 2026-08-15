@@ -179,3 +179,71 @@ def test_train_saves_the_adapter_when_given_a_fold():
     source = inspect.getsource(loop.train)
     assert "save_adapter" in source
     assert "config.adapter_dir" in source
+
+
+# --- generation must never truncate a prompt ----------------------------------
+
+def test_generation_context_exceeds_the_training_cap():
+    """MAX_SEQ_LEN is a TRAINING memory limit — attention is quadratic and at an
+    effective batch of 16 a T4 cannot hold more. Generation is batch 1 under
+    no_grad, so it does not apply, and the model itself handles 32,768.
+
+    Reusing the training cap capped base_few's prompts at 1,648 tokens when they
+    run to 3,641.
+    """
+    assert config.GEN_MAX_CONTEXT > config.MAX_SEQ_LEN
+
+
+def test_no_evaluation_prompt_is_truncated():
+    """The bug this guards: every base_few prompt overran the old cap and was
+    cut from the RIGHT, keeping the three exemplars and discarding the poem
+    being interpreted. base_few would have scored near zero on grounding, and
+    base_few vs lora_r8 — the headline contrast — would have measured
+    truncation.
+    """
+    import json
+
+    from src.data import filter as F
+    from src.data import splits
+    from src.generate import inference
+
+    pairs = splits.load_training_pairs()
+    if not pairs or not config.FOLD_ASSIGNMENT_PATH.exists():
+        return
+
+    blob = json.loads(config.FOLD_ASSIGNMENT_PATH.read_text())
+    by_id = {p["poem_id"]: p for p in pairs}
+    exemplars = [by_id[i] for i in blob["exemplar_poem_ids"] if i in by_id]
+    evaluation = [by_id[int(i)] for i in blob["eval_poem_ids"] if int(i) in by_id]
+    tokenizer = F.get_tokenizer()
+
+    budget = config.GEN_MAX_CONTEXT - config.GEN_MAX_NEW_TOKENS
+    for arm in ("base_zero", "base_few", "lora_r8"):
+        longest = max(
+            len(tokenizer(inference.build_prompt(p, arm, exemplars))["input_ids"])
+            for p in evaluation)
+        assert longest <= budget, (
+            f"{arm}'s longest prompt is {longest} tokens against a {budget} "
+            f"budget; it would be truncated and the target poem lost")
+
+
+def test_generate_one_asserts_rather_than_truncating():
+    import inspect
+
+    from src.generate import inference
+
+    source = inspect.getsource(inference.generate_one)
+    assert "truncation=True" not in source
+    assert "GEN_MAX_CONTEXT" in source
+
+
+def test_every_arm_shares_one_context_limit():
+    """A per-arm context limit would be a per-arm handicap, and the comparison
+    would measure the limit rather than the adaptation method."""
+    import inspect
+
+    from src.generate import inference
+
+    source = inspect.getsource(inference.generate_one)
+    assert source.count("GEN_MAX_CONTEXT") >= 1
+    assert "arm" not in source.split("assert")[1][:400]

@@ -109,7 +109,155 @@ def select_winner(records: list[dict]) -> dict:
     return {"rank": best["rank"], "learning_rate": best["learning_rate"]}
 
 
-def run_one(spec: dict, pairs: list[dict], fold: int | None = None):
+def load_completed() -> dict:
+    """Run name -> the row ``runs.csv`` recorded for it.
+
+    **Resumability is not a nicety here.** Nineteen runs will not fit a single
+    Kaggle session reliably, and a session that dies at run 14 must not restart
+    at run 1 — that is how a sweep gets abandoned.
+
+    Returns the whole row rather than just the name, because a name alone is not
+    enough to decide a run is done: see :func:`already_done`.
+    """
+    import csv
+    from pathlib import Path
+
+    path = Path(config.RUNS_CSV_PATH)
+    if not path.exists():
+        return {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        return {row["run"]: row for row in csv.DictReader(handle)
+                if row.get("run")}
+
+
+def already_done(spec: dict, completed: dict) -> bool:
+    """Whether ``spec`` has been run **at this configuration**.
+
+    Name matching alone is not sufficient, and the failure is concrete rather
+    than theoretical. The day-3 pilot is recorded as ``lora_r8_fold0`` at the
+    default learning rate — the same name stage 3 gives its fold-0 run. If the
+    sweep chooses a different learning rate, skipping on the name would keep the
+    pilot's adapter and ship a final result trained at a configuration the sweep
+    rejected. Nothing would raise: the row exists, the adapter exists, and the
+    name is right.
+
+    So the recorded hyperparameters must match too.
+    """
+    row = completed.get(spec.get("run") or run_name(spec))
+    if row is None:
+        return False
+
+    for key, default in (("rank", config.LORA_RANK),
+                         ("learning_rate", config.LEARNING_RATE)):
+        recorded, wanted = row.get(key), spec.get(key, default)
+        if recorded in (None, "", "None"):
+            return False
+        if abs(float(recorded) - float(wanted)) > 1e-12:
+            log.info("%s was run at %s=%s but is now specified as %s; "
+                     "re-running", row["run"], key, recorded, wanted)
+            return False
+    return True
+
+
+def final_specs(winner: dict) -> list[dict]:
+    """The six runs the results are reported from.
+
+    Five ``lora_r8``, one per fold — this is the cross-validation, and it is the
+    number 5-fold was bought for: how much the result moves with *which* poems
+    were trained on. Plus one ``lora_r16`` on the single-split fold, so
+    ``lora_r8`` vs ``lora_r16`` compares fold-1 against fold-1 rather than a
+    fold-averaged r8 against a single-split r16.
+
+    **The ranks are fixed at 8 and 16 regardless of what the sweep chose.** They
+    name the pre-registered arms; the sweep supplies the learning rate. Letting
+    a winning rank of 4 rename the arms would change the experiment after seeing
+    results, which is the freedom the pre-registration exists to remove — and
+    the rank question is answered by the reported curve, not by the arms.
+    """
+    lr = winner.get("learning_rate", config.LEARNING_RATE)
+    specs = [{"rank": 8, "learning_rate": lr, "fold": fold,
+              "run": f"lora_r8_fold{fold}"} for fold in range(config.N_FOLDS)]
+    specs.append({"rank": 16, "learning_rate": lr,
+                  "fold": config.SINGLE_SPLIT_FOLD,
+                  "run": f"lora_r16_fold{config.SINGLE_SPLIT_FOLD}"})
+    return specs
+
+
+def run_stage(specs: list[dict], pairs: list[dict], stage: str,
+              save_adapters: bool = False,
+              requires: tuple[str, ...] = ()) -> list[dict]:
+    """Run every spec not already recorded, and return all records for them.
+
+    Args:
+        save_adapters: False for sweep stages. Nine grid points would otherwise
+            collide — every rank-8 configuration writes to the same
+            ``adapter_dir(8, fold)``, so the last silently overwrites the rest
+            and the surviving adapter belongs to no recorded run in particular.
+            The final runs are the only ones whose weights are ever loaded.
+    """
+    done = load_completed()
+
+    # A row can match on name and configuration and still be unusable, because
+    # it predates a column the stage needs. The day-3 pilot is exactly that: it
+    # is recorded as lora_r8_fold0 at the default learning rate, but ran before
+    # heldout_perplexity existed. If the sweep happens to pick that same
+    # configuration, skipping it would leave H4 without a value for that fold
+    # and nothing would complain.
+    def usable(spec: dict) -> bool:
+        if not already_done(spec, done):
+            return False
+        row = done[spec.get("run") or run_name(spec)]
+        absent = [f for f in requires if row.get(f) in (None, "", "None")]
+        if absent:
+            log.info("%s exists but is missing %s; re-running",
+                     row["run"], ", ".join(absent))
+            return False
+        return True
+
+    pending = [s for s in specs if not usable(s)]
+    log.info("%s: %d run(s), %d already recorded, %d to run",
+             stage, len(specs), len(specs) - len(pending), len(pending))
+
+    for index, spec in enumerate(pending, 1):
+        name = spec.get("run") or run_name(spec)
+        log.info("[%s %d/%d] %s", stage, index, len(pending), name)
+        run_one(spec, pairs, fold=spec.get("fold"),
+                save_adapter=save_adapters)
+
+    import csv
+    from pathlib import Path
+
+    path = Path(config.RUNS_CSV_PATH)
+    if not path.exists():
+        return []
+    wanted = {s.get("run") or run_name(s) for s in specs}
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = [row for row in csv.DictReader(handle) if row["run"] in wanted]
+    # Newest per name wins: a re-run at a different configuration appends
+    # rather than replacing, so the earlier row must not be returned as well.
+    return list({row["run"]: row for row in rows}.values())
+
+
+def coerce(records: list[dict]) -> list[dict]:
+    """Numbers read back from CSV arrive as strings; selection needs floats."""
+    numeric = ("final_val_loss", "final_train_loss", "val_perplexity",
+               "heldout_perplexity", "trainable_params", "rank",
+               "learning_rate", "steps_run")
+    out = []
+    for row in records:
+        row = dict(row)
+        for key in numeric:
+            if row.get(key) not in (None, "", "None"):
+                try:
+                    row[key] = float(row[key])
+                except ValueError:
+                    pass
+        out.append(row)
+    return out
+
+
+def run_one(spec: dict, pairs: list[dict], fold: int | None = None,
+            save_adapter: bool = False):
     """Train one sweep configuration and return its ``runs.csv`` record.
 
     Everything is rebuilt per run — model, adapters, optimiser — because an
@@ -140,12 +288,17 @@ def run_one(spec: dict, pairs: list[dict], fold: int | None = None):
 
     return loop.train(
         model, tokenizer, examples, pairs,
-        run_name=run_name(spec),
+        run_name=spec.get("run") or run_name(spec),
+        fold=fold,
+        save_adapter=save_adapter,
         # None, not False: an absent key must fall through to the config
         # default (on), not silently disable early stopping for every grid run.
         early_stopping=spec.get("early_stopping"),
         rank=rank,
         learning_rate=spec.get("learning_rate", config.LEARNING_RATE),
+        # Threaded through, or the unmasked run trains masked and the axis
+        # reports a comparison that never happened.
+        masking=spec.get("masking", "masked"),
     )
 
 

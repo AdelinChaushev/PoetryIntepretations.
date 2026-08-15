@@ -207,3 +207,145 @@ def test_the_gpu_only_modules_are_smoke_runnable():
         source = inspect.getsource(module)
         assert '__name__ == "__main__"' in source, f"{module.__name__} has no entrypoint"
         assert "_smoke" in source
+
+
+# --- the driver ---------------------------------------------------------------
+
+def test_final_specs_are_the_six_reported_runs():
+    from src.train import sweep
+
+    specs = sweep.final_specs({"rank": 4, "learning_rate": 5e-4})
+    assert len(specs) == config.N_FOLDS + 1
+    assert sorted(s["fold"] for s in specs if s["rank"] == 8) == \
+        list(range(config.N_FOLDS))
+    r16 = [s for s in specs if s["rank"] == 16]
+    assert len(r16) == 1 and r16[0]["fold"] == config.SINGLE_SPLIT_FOLD
+
+
+def test_final_ranks_ignore_the_winning_rank():
+    """The arms are named lora_r8 and lora_r16 in the pre-registration. Letting
+    a winning rank of 4 rename them would change the experiment after seeing
+    results — the rank question is answered by the reported curve instead."""
+    from src.train import sweep
+
+    specs = sweep.final_specs({"rank": 4, "learning_rate": 1e-4})
+    assert {s["rank"] for s in specs} == {8, 16}
+    # The learning rate IS taken from the winner.
+    assert {s["learning_rate"] for s in specs} == {1e-4}
+
+
+def test_r16_shares_a_fold_with_an_r8_run():
+    """Otherwise lora_r8 vs lora_r16 compares a fold-averaged r8 against a
+    single-split r16, and the difference includes which poems each saw."""
+    from src.train import sweep
+
+    specs = sweep.final_specs({"learning_rate": 2e-4})
+    r16 = next(s for s in specs if s["rank"] == 16)
+    assert any(s["rank"] == 8 and s["fold"] == r16["fold"] for s in specs)
+
+
+def test_completed_runs_are_skipped(tmp_path, monkeypatch):
+    """19 runs will not reliably fit one Kaggle session. A session that dies at
+    run 14 must resume at 15, not restart at 1."""
+    import csv
+
+    from src.train import sweep
+
+    path = tmp_path / "runs.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["run", "final_val_loss"])
+        writer.writeheader()
+        writer.writerow({"run": "sweep_r8_lr0.0002", "final_val_loss": 1.6})
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+
+    assert set(sweep.load_completed()) == {"sweep_r8_lr0.0002"}
+
+
+def test_completed_is_empty_when_nothing_has_run(tmp_path, monkeypatch):
+    from src.train import sweep
+
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", tmp_path / "absent.csv")
+    assert sweep.load_completed() == {}
+
+
+def test_sweep_runs_do_not_save_adapters():
+    """Nine grid points at three ranks share three adapter paths, so saving
+    would leave one file per rank belonging to no recorded run in particular.
+    Only the final runs' weights are ever loaded."""
+    import inspect
+
+    from src.train import sweep
+
+    assert "save_adapters: bool = False" in inspect.getsource(sweep.run_stage)
+
+
+def test_csv_numbers_are_coerced_before_selection():
+    """runs.csv round-trips everything as strings, and '10.0' < '9.0' is True
+    under string ordering — which would silently pick the wrong winner."""
+    from src.train import sweep
+
+    rows = sweep.coerce([{"run": "a", "final_val_loss": "1.62",
+                          "trainable_params": "4399104", "rank": "8",
+                          "learning_rate": "0.0002"}])
+    assert rows[0]["final_val_loss"] == 1.62
+    assert rows[0]["trainable_params"] == 4399104.0
+
+
+def test_the_full_programme_is_19_runs():
+    from src.train import sweep
+
+    plan = sweep.plan()
+    assert plan["total"] == 13
+    assert plan["total"] + len(sweep.final_specs({})) == 19
+
+
+def test_a_name_match_at_the_wrong_config_is_not_done():
+    """The day-3 pilot is recorded as lora_r8_fold0 at the DEFAULT learning
+    rate, which is exactly the name stage 3 gives its fold-0 run. If the sweep
+    picks a different rate, skipping on the name alone would keep the pilot's
+    adapter and ship a final result trained at a configuration the sweep
+    rejected — with the row present, the adapter present, and the name right.
+    """
+    from src.train import sweep
+
+    pilot = {"run": "lora_r8_fold0", "rank": "8", "learning_rate": "0.0002"}
+    completed = {"lora_r8_fold0": pilot}
+
+    same = {"run": "lora_r8_fold0", "rank": 8, "learning_rate": 2e-4, "fold": 0}
+    other = {"run": "lora_r8_fold0", "rank": 8, "learning_rate": 5e-4, "fold": 0}
+
+    assert sweep.already_done(same, completed) is True
+    assert sweep.already_done(other, completed) is False
+
+
+def test_a_run_never_recorded_is_not_done():
+    from src.train import sweep
+
+    assert sweep.already_done({"rank": 8, "learning_rate": 2e-4}, {}) is False
+
+
+def test_a_row_missing_its_hyperparameters_is_re_run():
+    """Better to repeat a run than to trust a row that cannot prove what it
+    was."""
+    from src.train import sweep
+
+    completed = {"sweep_r8_lr0.0002": {"run": "sweep_r8_lr0.0002",
+                                       "rank": "", "learning_rate": ""}}
+    assert sweep.already_done({"rank": 8, "learning_rate": 2e-4},
+                              completed) is False
+
+
+def test_a_row_missing_a_required_column_is_re_run():
+    """The day-3 pilot is recorded as lora_r8_fold0 at the default learning
+    rate but predates heldout_perplexity. If the sweep picks that same config,
+    matching on name and hyperparameters would skip the final run and leave H4
+    without a value for that fold — silently."""
+    from src.train import sweep
+
+    pilot = {"run": "lora_r8_fold0", "rank": "8", "learning_rate": "0.0002",
+             "heldout_perplexity": ""}
+    spec = {"run": "lora_r8_fold0", "rank": 8, "learning_rate": 2e-4, "fold": 0}
+
+    assert sweep.already_done(spec, {"lora_r8_fold0": pilot}) is True
+    import inspect
+    assert "requires" in inspect.signature(sweep.run_stage).parameters
