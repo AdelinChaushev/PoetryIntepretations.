@@ -175,3 +175,46 @@ def test_poem_ids_are_derived_from_content_not_order():
                   for p in fetch_poems.assign_ids(shuffled)}
     original = {p["poem_id"]: (p["author"], p["title"]) for p in poems}
     assert renumbered == original
+
+
+def test_the_kaggle_clone_url_matches_the_actual_remote():
+    """The training notebook clones the repo before it can import anything, so
+    the URL is necessarily a literal and cannot be derived at runtime.
+
+    A stale one fails on Kaggle with "could not read Username for github.com" —
+    GitHub answers 404 to anonymous requests for a repo that does not exist, and
+    git falls through to asking for credentials. The message names neither the
+    wrong URL nor the real cause, which is why this is worth a test.
+    """
+    import json
+    import subprocess
+
+    remote = subprocess.run(["git", "remote", "get-url", "origin"],
+                            capture_output=True, text=True)
+    if remote.returncode != 0:
+        return                                  # no remote configured yet
+
+    notebook = json.loads(
+        (config.PROJECT_ROOT / "notebooks" / "04_training.ipynb").read_text())
+    clone_cells = [c for c in notebook["cells"]
+                   if "git" in "".join(c["source"])
+                   and "clone" in "".join(c["source"])]
+    assert clone_cells, "no clone cell found in 04_training.ipynb"
+
+    url = remote.stdout.strip()
+    assert any(url in "".join(c["source"]) for c in clone_cells), (
+        f"the notebook clones a different URL than origin ({url}); on Kaggle "
+        f"that fails with an authentication prompt, not a 'not found' error")
+
+
+def test_the_kaggle_cell_installs_trl():
+    """TRL owns the training loop and the label masking now. Kaggle images ship
+    transformers and peft but not always trl, and the failure would land after
+    the session has already spun up."""
+    import json
+
+    notebook = json.loads(
+        (config.PROJECT_ROOT / "notebooks" / "04_training.ipynb").read_text())
+    install = "".join("".join(c["source"]) for c in notebook["cells"]
+                      if "pip" in "".join(c["source"]))
+    assert "trl" in install
