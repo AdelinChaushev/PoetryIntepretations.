@@ -156,3 +156,64 @@ def test_the_length_filter_stayed_ours():
 def test_effective_batch_is_unchanged_by_the_split():
     """4x4 and 8x2 give the same update; only peak memory differs."""
     assert config.BATCH_SIZE * config.GRAD_ACCUM_STEPS == 16 or config.SMOKE
+
+
+# --- runs.csv survives a schema change ----------------------------------------
+
+def test_appending_a_new_field_migrates_the_header(tmp_path, monkeypatch):
+    """Each row is a GPU run, so losing one is expensive and corrupting one is
+    worse. A plain append writes no header when the file exists, so adding a
+    field puts N+1 values under N column names and every field after it shifts
+    by a column — silently, in the file select_winner and the figures read.
+
+    This is not hypothetical: it happened the first time a field was added.
+    """
+    import csv
+
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+
+    loop.append_run({"run": "a", "final_val_loss": 2.0})
+    loop.append_run({"run": "b", "final_val_loss": 1.5, "adapter": "x"})
+
+    rows = list(csv.DictReader(path.open()))
+    assert len(rows) == 2, "a run was lost during migration"
+    assert rows[0]["run"] == "a" and rows[1]["run"] == "b"
+    # The old row keeps its values and gets a blank for the new column.
+    assert rows[0]["final_val_loss"] == "2.0" and rows[0]["adapter"] == ""
+    assert rows[1]["adapter"] == "x"
+
+
+def test_a_removed_field_does_not_shift_the_columns(tmp_path, monkeypatch):
+    import csv
+
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+
+    loop.append_run({"run": "a", "rank": 8, "final_val_loss": 2.0})
+    loop.append_run({"run": "b", "final_val_loss": 1.5})
+
+    rows = list(csv.DictReader(path.open()))
+    assert rows[1]["run"] == "b" and rows[1]["final_val_loss"] == "1.5"
+    assert rows[1]["rank"] == ""
+
+
+def test_every_row_has_the_same_column_count(tmp_path, monkeypatch):
+    """The direct statement of the property. A misaligned row still parses —
+    csv does not complain — so this checks the raw line widths."""
+    from src.train import loop
+
+    path = tmp_path / "runs.csv"
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+
+    loop.append_run({"run": "a", "loss": 1.0})
+    loop.append_run({"run": "b", "loss": 0.9, "extra": 1})
+    loop.append_run({"run": "c", "loss": 0.8, "extra": 2, "more": 3})
+
+    widths = {len(line.split(",")) for line in
+              path.read_text().strip().splitlines()}
+    assert len(widths) == 1, f"rows have differing widths: {widths}"

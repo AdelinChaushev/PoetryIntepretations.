@@ -28,9 +28,12 @@ def output(poem_id, arm, adapter=..., fold=...):
 # --- routing ------------------------------------------------------------------
 
 def test_each_poem_routes_to_its_own_folds_adapter():
+    """Ends-with rather than equals: SMOKE prefixes the directory so a
+    five-step gpt2 adapter cannot occupy a real adapter's path. The convention
+    that matters — rank and fold in the name — is what is pinned here."""
     for poem_id, fold in FOLD_OF.items():
         path = inference.adapter_for(poem_id, "lora_r8", FOLD_OF)
-        assert path.name == f"lora_r8_fold{fold}"
+        assert path.name.endswith(f"lora_r8_fold{fold}")
 
 
 def test_untrained_arms_have_no_adapter():
@@ -139,3 +142,40 @@ def test_base_few_without_exemplars_raises():
     except AssertionError:
         return
     raise AssertionError("base_few built a prompt with no exemplars")
+
+
+# --- the adapter a run writes is the one generation looks for -----------------
+
+def test_training_and_generation_agree_on_the_adapter_path():
+    """The convention was written in three places and two spellings, agreeing
+    only while LORA_RANK == 8. A mismatch does not fail cleanly for every poem
+    — it loses one arm or one fold, which reads as a partial run."""
+    from src.generate import inference
+
+    for fold in range(config.N_FOLDS):
+        assert (inference.adapter_for(1, "lora_r8", {1: fold})
+                == config.adapter_dir(8, fold))
+
+    single = config.SINGLE_SPLIT_FOLD
+    assert (inference.adapter_for(1, "lora_r16", {1: single})
+            == config.adapter_dir(16, single))
+
+
+def test_adapter_paths_are_distinct_per_rank_and_fold():
+    """Two runs sharing a path would silently overwrite each other, and the
+    second would generate for poems the first held out."""
+    paths = {config.adapter_dir(rank, fold)
+             for rank in (8, 16) for fold in range(config.N_FOLDS)}
+    assert len(paths) == 2 * config.N_FOLDS
+
+
+def test_train_saves_the_adapter_when_given_a_fold():
+    """Kaggle sessions die. An adapter saved by a LATER notebook cell is one a
+    dead kernel loses, costing the run rather than the cell."""
+    import inspect
+
+    from src.train import loop
+
+    source = inspect.getsource(loop.train)
+    assert "save_adapter" in source
+    assert "config.adapter_dir" in source

@@ -33,6 +33,14 @@ data/*.pre-retry.*
 results/checkpoints/
 *.ckpt
 
+# Smoke artifacts are gpt2 output from five-step runs. They exist to prove the
+# code executes, not to be read as results, and a reader finding runs.csv next
+# to smoke_runs.csv has to work out which is which. Everything SMOKE writes
+# carries this prefix, so one rule covers all of it.
+results/smoke_*
+results/adapters/smoke_*
+results/histories/smoke.json
+
 # Python
 __pycache__/
 *.py[cod]

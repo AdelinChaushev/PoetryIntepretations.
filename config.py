@@ -122,6 +122,27 @@ SWAP_SUMMARY_CSV_PATH: Path = RESULTS_DIR / "swap_test_summary.csv"
 MANIFEST_PATH: Path = RESULTS_DIR / "manifest.json"
 ARM_OUTPUTS_PATH: Path = _result("arm_outputs.json")
 ADAPTERS_DIR: Path = RESULTS_DIR / "adapters"
+
+
+def adapter_dir(rank: int, fold: int) -> Path:
+    """Canonical location of one trained adapter.
+
+    **One definition, because two would drift silently.** Training writes the
+    adapter and `generate.inference.adapter_for` reads it back, and if those
+    spellings ever disagree the failure is not a clean "file not found" for
+    every poem — it is a missing adapter for *one* arm or *one* fold, which
+    looks like a partial run rather than a naming bug.
+
+    The rank is in the name because `lora_r8` and `lora_r16` are separate arms
+    trained from the same code path; the fold is in the name because `lora_r8`
+    has five adapters and each may only generate for the poems its own fold
+    held out.
+
+    Smoke runs get their own prefix, so a five-step gpt2 adapter never occupies
+    the path a real one is loaded from. Both training and generation resolve
+    through here, so the two stay consistent in either mode.
+    """
+    return ADAPTERS_DIR / f"{'smoke_' if SMOKE else ''}lora_r{rank}_fold{fold}"
 FIGURES_DIR: Path = RESULTS_DIR / "figures"
 
 

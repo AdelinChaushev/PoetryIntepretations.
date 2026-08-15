@@ -73,15 +73,18 @@ def adapter_for(poem_id: int, arm: str, fold_of: dict) -> "object | None":
         f"poem {poem_id} has no fold; it cannot be routed to an adapter and "
         f"must not be generated for a trained arm")
 
+    # Via config.adapter_dir, never spelled out here: training writes the same
+    # path, and two spellings of one convention drift into a missing adapter for
+    # one arm or one fold — which reads as a partial run, not as a naming bug.
     if arm == "lora_r8":
-        return config.ADAPTERS_DIR / f"lora_r8_fold{fold}"
+        return config.adapter_dir(8, fold)
 
     if arm == "lora_r16":
         assert fold == config.SINGLE_SPLIT_FOLD, (
             f"lora_r16 is trained only on fold {config.SINGLE_SPLIT_FOLD}'s "
             f"partition, so poem {poem_id} (fold {fold}) was in its TRAINING "
             f"data. Generating for it would evaluate on training data.")
-        return config.ADAPTERS_DIR / f"lora_r16_fold{fold}"
+        return config.adapter_dir(16, fold)
 
     raise ValueError(f"unknown arm {arm!r}")
 
@@ -234,6 +237,12 @@ def _smoke() -> None:
 
     config.configure_logging()
     assert config.SMOKE, "run with SMOKE=1; this is a size flag, not a mode"
+
+    # Start clean, or a second invocation reports "0 to generate" and exercises
+    # the cache instead of the generation path it exists to test. Safe because
+    # SMOKE resolves this to smoke_arm_outputs.json.
+    assert "smoke" in config.ARM_OUTPUTS_PATH.name, "refusing to clear real outputs"
+    config.ARM_OUTPUTS_PATH.unlink(missing_ok=True)
 
     pairs = splits.load_training_pairs()
     fold_of = splits.load_assignment()

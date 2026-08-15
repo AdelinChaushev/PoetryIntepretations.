@@ -173,8 +173,21 @@ def training_arguments(run_name: str, steps: int, output_dir, **overrides):
 
 def train(model, tokenizer, examples: list[dict], pairs: list[dict],
           run_name: str, max_steps: int | None = None,
-          early_stopping: bool | None = None, **overrides) -> dict:
-    """Train one adapter. Returns the run record written to ``runs.csv``."""
+          early_stopping: bool | None = None, fold: int | None = None,
+          **overrides) -> dict:
+    """Train one adapter. Returns the run record written to ``runs.csv``.
+
+    Pass ``fold`` to have the adapter written here, in the same call that
+    trained it. Kaggle sessions die, and an adapter saved by a *later* notebook
+    cell is one a dead kernel loses — costing the whole run, not just the cell.
+    The path comes from :func:`config.adapter_dir`, the same function
+    ``inference.adapter_for`` reads back, so the two cannot drift.
+
+    With ``load_best_model_at_end`` the object saved holds the **best** weights
+    rather than the ones the run stopped on. Verified rather than assumed: the
+    written adapter is byte-identical to the best checkpoint and differs from
+    the last.
+    """
     from datasets import Dataset
     from transformers import EarlyStoppingCallback
     from trl import SFTTrainer
@@ -239,7 +252,20 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         # So a smoke row is identifiable even if it reaches the real file by
         # some other route. sweep.select_winner refuses to select on it.
         "smoke": config.SMOKE,
+        "fold": fold,
+        "adapter": None,
     }
+
+    if fold is not None:
+        from src.model import setup
+
+        # trainer.model IS the object passed in, and load_best_model_at_end has
+        # already restored the best weights into it, so this writes the best
+        # adapter rather than the one the run happened to stop on.
+        path = config.adapter_dir(overrides.get("rank", config.LORA_RANK), fold)
+        setup.save_adapter(trainer.model, path)
+        record["adapter"] = str(path)
+
     append_run(record)
     return record
 
@@ -252,21 +278,59 @@ def save_history(history: list[dict], run_name: str) -> None:
 
 
 def append_run(record: dict) -> None:
-    """Append one row to ``runs.csv``, creating it with a header if absent.
+    """Append one row to ``runs.csv``, migrating the header if it has changed.
 
     Append rather than rewrite: a Kaggle session that dies mid-sweep must not
-    take the earlier rows with it.
+    take the earlier rows with it. Each row is a GPU run, so losing one is
+    expensive and corrupting one is worse.
+
+    **The header is reconciled, not assumed.** A plain append writes no header
+    when the file exists, so adding a field to the record puts N+1 values under
+    N column names and every field after the new one shifts by a column —
+    silently, in the file ``select_winner`` and every figure read from. That is
+    not hypothetical: it happened here the first time a field was added
+    mid-project. When the columns disagree the file is rewritten with the union,
+    old rows padded with blanks, so no run is lost and none is misaligned.
     """
     import csv
 
     path = Path(config.RUNS_CSV_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(record))
-        if not exists:
+
+    existing_rows: list[dict] = []
+    header: list[str] = []
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            header = list(reader.fieldnames or [])
+            existing_rows = list(reader)
+
+    if not header:
+        fields = list(record)
+    elif set(header) == set(record):
+        fields = header
+    else:
+        # Union, preserving the existing order so a reader's columns do not
+        # shuffle, with genuinely new fields appended.
+        fields = header + [f for f in record if f not in header]
+        log.warning("runs.csv schema changed (%s); rewriting %d existing row(s) "
+                    "with the union of columns rather than appending a "
+                    "misaligned row",
+                    ", ".join(f for f in fields if f not in header),
+                    len(existing_rows))
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields,
+                                    extrasaction="ignore")
             writer.writeheader()
-        writer.writerow(record)
+            for row in existing_rows:
+                writer.writerow({f: row.get(f, "") for f in fields})
+
+    write_header = not path.exists() or not header
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({f: record.get(f, "") for f in fields})
     log.info("run recorded in %s", path)
 
 
@@ -296,13 +360,33 @@ def _smoke() -> None:
         f"every pair exceeded MAX_SEQ_LEN={config.MAX_SEQ_LEN}; nothing to "
         f"train on")
 
+    # fold is passed so the ADAPTER SAVE is exercised too. Without it the smoke
+    # run verifies training and skips the step whose failure costs the run.
     record = train(model, tokenizer, examples, pairs, run_name="smoke",
-                   max_steps=config.MAX_STEPS)
+                   max_steps=config.MAX_STEPS, fold=config.SINGLE_SPLIT_FOLD)
     print(f"\n  {record['steps_run']} steps on {record['n_train']} examples "
           f"in {record['wall_clock_seconds']}s")
     print(f"  val loss {record['final_val_loss']:.4f}  ->  perplexity "
           f"{record['val_perplexity']:.2f}")
     print(f"  written to {config.RUNS_CSV_PATH.name} (smoke={record['smoke']})")
+
+    saved = Path(record["adapter"])
+    print(f"\n  adapter {saved.name}")
+    print(f"    files {sorted(f.name for f in saved.iterdir())}")
+    print(f"    size  {sum(f.stat().st_size for f in saved.iterdir())/1024**2:.2f} MB")
+
+    # It must load back onto a fresh base model, which is what the README
+    # promises a reader and what generation does five times over.
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+
+    PeftModel.from_pretrained(
+        AutoModelForCausalLM.from_pretrained(config.MODEL), str(saved))
+    print(f"    reloads onto a fresh {config.MODEL}: True")
+
+    from src.generate import inference
+    expected = inference.adapter_for(1, "lora_r8", {1: config.SINGLE_SPLIT_FOLD})
+    print(f"    generation looks for it here too: {saved == expected}")
 
 
 if __name__ == "__main__":
