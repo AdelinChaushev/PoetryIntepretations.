@@ -79,6 +79,18 @@ def select_winner(records: list[dict]) -> dict:
     """
     metric = config.SWEEP_SELECTION_METRIC
 
+    # **Selection may never read the held-out fold.** That fold is measured once
+    # per run and recorded, which is safe only because nothing is chosen on it.
+    # The moment a hyperparameter is picked by held-out score, the held-out fold
+    # stops being a test set and becomes a second validation set — and the
+    # numbers reported from it become as optimistic as validation already is,
+    # which is the exact problem heldout_perplexity was added to fix.
+    assert "heldout" not in metric, (
+        f"SWEEP_SELECTION_METRIC is {metric!r}. Selecting on the held-out fold "
+        f"turns it into a validation set: every number later reported from it "
+        f"would carry the selection bias that measuring it separately exists to "
+        f"avoid. Select on validation; report on held-out.")
+
     # Rows from a different model must never compete. A five-step gpt2 smoke run
     # can post a lower validation loss than a real one — fewer examples, a
     # smaller vocabulary — and would then be returned as the winning
@@ -106,7 +118,10 @@ def select_winner(records: list[dict]) -> dict:
     best = min(usable, key=lambda r: (sign * r[metric], r["trainable_params"]))
     log.info("winner: %s with %s=%.4f (%s trainable)", best["run"], metric,
              best[metric], f"{best['trainable_params']:,}")
-    return {"rank": best["rank"], "learning_rate": best["learning_rate"]}
+    # int, not whatever the CSV produced: peft builds nn.Linear(in_features, r)
+    # and a float r fails several frames deep with no mention of the rank.
+    return {"rank": int(best["rank"]),
+            "learning_rate": float(best["learning_rate"])}
 
 
 def load_completed() -> dict:
@@ -238,15 +253,34 @@ def run_stage(specs: list[dict], pairs: list[dict], stage: str,
     return list({row["run"]: row for row in rows}.values())
 
 
+#: Columns that must come back as ``int``, not ``float``. CSV round-trips
+#: everything as text, and a blanket ``float()`` turns rank 16 into 16.0 — which
+#: propagates through select_winner into ``LoraConfig(r=16.0)`` and dies deep
+#: inside peft at ``nn.Linear(in_features, 16.0)``, with a message naming
+#: neither the rank nor the sweep. It also renames the run ``sweep_r16.0_...``,
+#: so the stage would not match its own rows on a resume.
+INTEGER_COLUMNS: tuple[str, ...] = ("rank", "trainable_params", "steps_run",
+                                    "n_train", "n_validation", "n_heldout",
+                                    "fold", "max_steps", "seed")
+
+FLOAT_COLUMNS: tuple[str, ...] = ("final_val_loss", "final_train_loss",
+                                  "val_perplexity", "heldout_perplexity",
+                                  "heldout_loss", "learning_rate",
+                                  "wall_clock_seconds")
+
+
 def coerce(records: list[dict]) -> list[dict]:
-    """Numbers read back from CSV arrive as strings; selection needs floats."""
-    numeric = ("final_val_loss", "final_train_loss", "val_perplexity",
-               "heldout_perplexity", "trainable_params", "rank",
-               "learning_rate", "steps_run")
+    """Numbers read back from CSV arrive as strings; restore their real types."""
     out = []
     for row in records:
         row = dict(row)
-        for key in numeric:
+        for key in INTEGER_COLUMNS:
+            if row.get(key) not in (None, "", "None"):
+                try:
+                    row[key] = int(float(row[key]))
+                except ValueError:
+                    pass
+        for key in FLOAT_COLUMNS:
             if row.get(key) not in (None, "", "None"):
                 try:
                     row[key] = float(row[key])

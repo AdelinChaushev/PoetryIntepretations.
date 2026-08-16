@@ -123,6 +123,12 @@ def lora_config(rank: int | None = None, target_modules=None, dropout=None):
     from peft import LoraConfig
 
     rank = config.LORA_RANK if rank is None else rank
+    # A float rank reaches nn.Linear(in_features, r) and fails several frames
+    # inside peft with a message naming neither the rank nor its source. It
+    # arrives that way from runs.csv, where every column round-trips as text.
+    assert isinstance(rank, int) and not isinstance(rank, bool), (
+        f"rank must be an int, got {rank!r} ({type(rank).__name__}). peft builds "
+        f"nn.Linear(in_features, r) and a float fails deep inside it.")
     return LoraConfig(
         r=rank,
         lora_alpha=config.lora_alpha(rank),

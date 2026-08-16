@@ -349,3 +349,76 @@ def test_a_row_missing_a_required_column_is_re_run():
     assert sweep.already_done(spec, {"lora_r8_fold0": pilot}) is True
     import inspect
     assert "requires" in inspect.signature(sweep.run_stage).parameters
+
+
+def test_selection_refuses_to_read_the_held_out_fold():
+    """The held-out fold is measured once per run and recorded, which is safe
+    ONLY because nothing is chosen on it. Select on it and it stops being a test
+    set — every number later reported from it would carry exactly the selection
+    bias that measuring it separately exists to avoid.
+    """
+    from src.train import sweep
+
+    original = config.SWEEP_SELECTION_METRIC
+    try:
+        config.SWEEP_SELECTION_METRIC = "heldout_perplexity"
+        sweep.select_winner([real_run("a", 1.0)])
+    except AssertionError as error:
+        assert "turns it into a validation set" in str(error)
+        return
+    finally:
+        config.SWEEP_SELECTION_METRIC = original
+    raise AssertionError("selection on the held-out fold was permitted")
+
+
+def test_the_pre_registered_metric_is_a_validation_one():
+    assert "heldout" not in config.SWEEP_SELECTION_METRIC
+    assert config.SWEEP_SELECTION_METRIC == "final_val_loss"
+
+
+def test_the_winner_survives_a_csv_round_trip():
+    """The bug this catches: coerce() cast every numeric column with float(),
+    so rank 16 became 16.0, propagated into LoraConfig(r=16.0), and died inside
+    peft at nn.Linear(in_features, 16.0) — several frames deep, naming neither
+    the rank nor the sweep. It also renamed the run `sweep_r16.0_...`, so the
+    stage would not have matched its own rows on a resume.
+
+    Earlier tests missed it by calling select_winner with dict literals holding
+    int ranks, never with rows that had been through coerce.
+    """
+    from src.model import setup
+    from src.train import sweep
+
+    as_csv = [{"run": "sweep_r16_lr0.0002", "model": config.MODEL,
+               "rank": "16", "learning_rate": "0.0002",
+               "trainable_params": "8798208", "final_val_loss": "1.55"}]
+    winner = sweep.select_winner(sweep.coerce(as_csv))
+
+    assert isinstance(winner["rank"], int)
+    assert isinstance(winner["learning_rate"], float)
+    # The name must not carry a decimal point, or resume matching breaks.
+    assert "." not in sweep.run_name(winner).split("_lr")[0]
+    # And it must be usable where it is actually consumed.
+    setup.lora_config(winner["rank"])
+
+
+def test_a_float_rank_is_refused_at_the_point_of_use():
+    from src.model import setup
+
+    try:
+        setup.lora_config(16.0)
+    except AssertionError as error:
+        assert "must be an int" in str(error)
+        return
+    raise AssertionError("a float rank reached LoraConfig")
+
+
+def test_curve_specs_inherit_an_integer_rank():
+    from src.train import sweep
+
+    as_csv = [{"run": "sweep_r16_lr0.0002", "model": config.MODEL, "rank": "16",
+               "learning_rate": "0.0002", "trainable_params": "8798208",
+               "final_val_loss": "1.55"}]
+    winner = sweep.select_winner(sweep.coerce(as_csv))
+    for spec in sweep.reported_curves(winner) + sweep.final_specs(winner):
+        assert isinstance(spec["rank"], int), spec
