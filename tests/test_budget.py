@@ -287,3 +287,111 @@ def test_backfill_skips_rows_with_no_adapter_on_disk(tmp_path, monkeypatch):
     loop.append_run({"run": "sweep_r8_lr0.0002", "fold": "", "adapter": "",
                      "heldout_perplexity": ""})
     assert loop.backfill_heldout_perplexity([], None) == []
+
+
+# --- surviving a session boundary ---------------------------------------------
+
+def test_archive_gathers_everything_that_cannot_be_rebuilt(tmp_path, monkeypatch):
+    """Only adapters come down from Kaggle and the model never does, so each of
+    these is a GPU session to recreate."""
+    from src.train import loop
+
+    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", tmp_path / "runs.csv")
+    monkeypatch.setattr(config, "ADAPTERS_DIR", tmp_path / "adapters")
+    monkeypatch.setattr(config, "FIGURES_DIR", tmp_path / "figures")
+
+    (tmp_path / "runs.csv").write_text("run,final_val_loss\na,1.5\n")
+    (tmp_path / "adapters" / "lora_r8_fold0").mkdir(parents=True)
+    (tmp_path / "adapters" / "lora_r8_fold0" / "adapter_model.safetensors"
+     ).write_bytes(b"weights")
+
+    archive = loop.archive_results()
+    assert archive.exists() and archive.suffix == ".zip"
+
+    import zipfile
+    names = zipfile.ZipFile(archive).namelist()
+    assert any("runs.csv" in n for n in names)
+    assert any("adapter_model.safetensors" in n for n in names)
+
+
+def test_archive_tolerates_a_partial_session(tmp_path, monkeypatch):
+    """It must work mid-sweep, not only at the end — that is when it matters."""
+    from src.train import loop
+
+    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", tmp_path / "runs.csv")
+    monkeypatch.setattr(config, "ADAPTERS_DIR", tmp_path / "adapters")
+    monkeypatch.setattr(config, "FIGURES_DIR", tmp_path / "figures")
+    (tmp_path / "runs.csv").write_text("run\na\n")
+
+    assert loop.archive_results().exists()          # no adapters yet: fine
+
+
+def test_restore_puts_runs_csv_where_resume_reads_it(tmp_path, monkeypatch):
+    """The half that was missing. load_completed reads RESULTS_DIR/runs.csv;
+    without restoring it, a new session starts empty and repeats every run
+    already paid for."""
+    from src.train import loop, sweep
+
+    source, results = tmp_path / "input", tmp_path / "working"
+    (source / "adapters" / "lora_r8_fold0").mkdir(parents=True)
+    (source / "adapters" / "lora_r8_fold0" / "adapter_config.json").write_text("{}")
+    (source / "runs.csv").write_text(
+        "run,rank,learning_rate\nsweep_r8_lr0.0002,8,0.0002\n")
+    results.mkdir()
+
+    monkeypatch.setattr(config, "RESULTS_DIR", results)
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", results / "runs.csv")
+    monkeypatch.setattr(config, "ADAPTERS_DIR", results / "adapters")
+    monkeypatch.setattr(config, "FIGURES_DIR", results / "figures")
+
+    restored = loop.restore_results(source)
+    assert "runs.csv" in restored and "adapters" in restored
+    assert set(sweep.load_completed()) == {"sweep_r8_lr0.0002"}
+
+
+def test_restore_refuses_a_path_that_does_not_exist(tmp_path):
+    """Silently restoring nothing would look like a fresh start and repeat the
+    whole sweep."""
+    from src.train import loop
+
+    try:
+        loop.restore_results(tmp_path / "absent")
+    except AssertionError as error:
+        assert "starts over" in str(error)
+        return
+    raise AssertionError("a missing restore path was accepted")
+
+
+def test_the_curve_drops_the_post_restore_evaluation(tmp_path, monkeypatch):
+    """train() evaluates once more after load_best_model_at_end restores the
+    best weights, so the last history entry DUPLICATES the best rather than
+    continuing the trajectory. Plotted raw, figure 3 shows a false recovery —
+    loss climbing through overfitting and then dropping back, which is the
+    restore rather than learning.
+    """
+    import json
+
+    from src.train import loop
+
+    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path)
+    (tmp_path / "histories").mkdir()
+    (tmp_path / "histories" / "r.json").write_text(json.dumps([
+        {"epoch": 1.0, "loss": 2.0}, {"epoch": 1.0, "eval_loss": 1.90},
+        {"epoch": 2.0, "loss": 1.7}, {"epoch": 2.0, "eval_loss": 1.61},
+        {"epoch": 3.0, "loss": 1.5}, {"epoch": 3.0, "eval_loss": 1.68},
+        {"epoch": 3.0, "eval_loss": 1.61},          # the restore evaluation
+    ]))
+
+    curve = loop.training_curve("r")
+    assert len(curve["eval"]) == 3, "the restore evaluation was kept"
+    assert curve["eval"][-1][1] == 1.68, "the curve must END on the rise"
+    assert curve["best"] == 1.61
+
+
+def test_the_curve_is_empty_for_a_run_with_no_history(tmp_path, monkeypatch):
+    from src.train import loop
+
+    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path)
+    assert loop.training_curve("absent")["eval"] == []

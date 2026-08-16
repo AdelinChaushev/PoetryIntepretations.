@@ -249,17 +249,16 @@ def final_specs(winner: dict) -> list[dict]:
 
 
 def run_stage(specs: list[dict], pairs: list[dict], stage: str,
-              save_adapters: bool = False,
+              save_adapters: bool = True,
               requires: tuple[str, ...] = (),
               max_runs: int | None = None) -> list[dict]:
     """Run every spec not already recorded, and return all records for them.
 
     Args:
-        save_adapters: False for sweep stages. Nine grid points would otherwise
-            collide — every rank-8 configuration writes to the same
-            ``adapter_dir(8, fold)``, so the last silently overwrites the rest
-            and the surviving adapter belongs to no recorded run in particular.
-            The final runs are the only ones whose weights are ever loaded.
+        save_adapters: on by default. Adapters are keyed on the run name, so
+            sweep configurations no longer collide the way ``(rank, fold)``
+            made them, and every row in ``runs.csv`` stays traceable to the
+            weights that produced it.
     """
     done = load_completed()
 

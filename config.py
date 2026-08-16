@@ -124,8 +124,29 @@ ARM_OUTPUTS_PATH: Path = _result("arm_outputs.json")
 ADAPTERS_DIR: Path = RESULTS_DIR / "adapters"
 
 
+def run_adapter_dir(run_name: str) -> Path:
+    """Where a run's adapter is written, keyed on the RUN NAME.
+
+    Every run keeps its weights, which is both tidier and more defensible: each
+    row in ``runs.csv`` is then traceable to the model that produced it, and a
+    sweep configuration that later turns out to matter can be inspected rather
+    than retrained.
+
+    Keyed on the run name because ``(rank, fold)`` is not unique across a sweep —
+    three learning rates at rank 8 all resolve to the same ``lora_r8_fold0`` and
+    would overwrite each other, leaving one file belonging to no recorded run in
+    particular. The run name encodes everything that varied, which is exactly the
+    property needed here.
+
+    :func:`adapter_dir` is the same path for final runs, because ``final_specs``
+    names them ``lora_r{rank}_fold{fold}``. The two cannot drift: one delegates
+    to the other.
+    """
+    return ADAPTERS_DIR / f"{'smoke_' if SMOKE else ''}{run_name}"
+
+
 def adapter_dir(rank: int, fold: int) -> Path:
-    """Canonical location of one trained adapter.
+    """Canonical location of one FINAL adapter — the ones generation loads.
 
     **One definition, because two would drift silently.** Training writes the
     adapter and `generate.inference.adapter_for` reads it back, and if those
@@ -142,7 +163,7 @@ def adapter_dir(rank: int, fold: int) -> Path:
     the path a real one is loaded from. Both training and generation resolve
     through here, so the two stay consistent in either mode.
     """
-    return ADAPTERS_DIR / f"{'smoke_' if SMOKE else ''}lora_r{rank}_fold{fold}"
+    return run_adapter_dir(f"lora_r{rank}_fold{fold}")
 FIGURES_DIR: Path = RESULTS_DIR / "figures"
 
 

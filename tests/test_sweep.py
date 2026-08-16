@@ -269,15 +269,47 @@ def test_completed_is_empty_when_nothing_has_run(tmp_path, monkeypatch):
     assert sweep.load_completed() == {}
 
 
-def test_sweep_runs_do_not_save_adapters():
-    """Nine grid points at three ranks share three adapter paths, so saving
-    would leave one file per rank belonging to no recorded run in particular.
-    Only the final runs' weights are ever loaded."""
+def test_every_run_keeps_its_weights():
+    """On by default. Each row in runs.csv is then traceable to the model that
+    produced it, and a sweep configuration that later matters can be inspected
+    rather than retrained."""
     import inspect
 
     from src.train import sweep
 
-    assert "save_adapters: bool = False" in inspect.getsource(sweep.run_stage)
+    assert "save_adapters: bool = True" in inspect.getsource(sweep.run_stage)
+
+
+def test_adapter_paths_never_collide_across_the_programme():
+    """The reason weights were not saved before. Three learning rates at rank 8
+    all resolve to the same (rank, fold), so keying on that would leave one file
+    per rank belonging to no recorded run in particular. Keying on the run name
+    — which encodes everything that varied — fixes it."""
+    from src.train import sweep
+
+    names = ([sweep.run_name(s) for s in sweep.lr_specs()]
+             + [sweep.run_name(s) for s in sweep.rank_specs(5e-4)]
+             + [sweep.run_name(s) for s in sweep.reported_curves(
+                 {"rank": 16, "learning_rate": 5e-4})]
+             + [s["run"] for s in sweep.final_specs({"learning_rate": 5e-4})])
+    paths = [config.run_adapter_dir(n) for n in names]
+    assert len(set(paths)) == len(set(names)), "two runs share an adapter path"
+
+
+def test_final_adapter_paths_are_what_generation_looks_for():
+    """run_adapter_dir and adapter_dir must agree for the final runs, or
+    training writes weights generation never finds — a missing adapter for one
+    fold, which reads as a partial run rather than a naming bug."""
+    from src.generate import inference
+    from src.train import sweep
+
+    for spec in sweep.final_specs({"learning_rate": 2e-4}):
+        assert (config.run_adapter_dir(spec["run"])
+                == config.adapter_dir(spec["rank"], spec["fold"]))
+
+    for fold in range(config.N_FOLDS):
+        assert (inference.adapter_for(1, "lora_r8", {1: fold})
+                == config.run_adapter_dir(f"lora_r8_fold{fold}"))
 
 
 def test_csv_numbers_are_coerced_before_selection():

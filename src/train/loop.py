@@ -473,13 +473,18 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
                  fold, metrics["perplexity"], metrics["n"],
                  record["val_perplexity"])
 
-    if fold is not None and save_adapter:
+    if save_adapter:
         from src.model import setup
 
         # trainer.model IS the object passed in, and load_best_model_at_end has
         # already restored the best weights into it, so this writes the best
         # adapter rather than the one the run happened to stop on.
-        path = config.adapter_dir(overrides.get("rank", config.LORA_RANK), fold)
+        #
+        # Keyed on the run name, not (rank, fold): three learning rates at rank
+        # 8 share one (rank, fold) and would overwrite each other. Every run
+        # keeps its weights, so every row in runs.csv is traceable to the model
+        # that produced it.
+        path = config.run_adapter_dir(run_name)
         setup.save_adapter(trainer.model, path)
         record["adapter"] = str(path)
 
@@ -576,11 +581,127 @@ def backfill_heldout_perplexity(pairs: list[dict], tokenizer) -> list[dict]:
     return filled
 
 
+#: Everything a GPU session produces that cannot be rebuilt on the laptop,
+#: because only adapters come down and the model never does.
+SESSION_ARTIFACTS: tuple[str, ...] = ("runs.csv", "adapters", "histories",
+                                      "contamination.jsonl",
+                                      "base_perplexity.json")
+
+
+def archive_results(destination=None) -> Path:
+    """Bundle this session's output into one zip to download.
+
+    ``/kaggle/working`` is wiped when a session ends, and ``runs.csv`` is the
+    only record that a run happened — ``sweep.load_completed`` reads it to decide
+    what to skip. A resume file that lives only in the directory Kaggle deletes
+    is not a resume file, and twelve runs were lost proving it.
+
+    Safe to call at any point: missing pieces are reported and skipped rather
+    than raising, so it works mid-sweep as well as at the end.
+    """
+    import shutil
+
+    config.ensure_dirs()
+    stage = Path(config.RESULTS_DIR) / "to_download"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+
+    for name in SESSION_ARTIFACTS:
+        source = Path(config.RESULTS_DIR) / name
+        if not source.exists():
+            log.info("  %-22s absent, skipped", name)
+            continue
+        if source.is_dir():
+            shutil.copytree(source, stage / name)
+            size = sum(f.stat().st_size for f in source.rglob("*") if f.is_file())
+        else:
+            shutil.copy2(source, stage / name)
+            size = source.stat().st_size
+        log.info("  %-22s %.2f MB", name, size / 1024 ** 2)
+
+    target = Path(config.RESULTS_DIR) / "session_output" if destination is None \
+        else Path(destination)
+    archive = Path(shutil.make_archive(str(target), "zip", stage))
+    log.info("wrote %s (%.2f MB) — DOWNLOAD IT before the session ends",
+             archive, archive.stat().st_size / 1024 ** 2)
+    return archive
+
+
+def restore_results(source) -> dict:
+    """Copy a previous session's artifacts back into place.
+
+    The half that was missing. ``sweep.load_completed`` reads ``runs.csv`` from
+    ``RESULTS_DIR``; without this, every new session starts from an empty file
+    and re-runs everything already paid for. Point ``source`` at the unzipped
+    Kaggle Dataset holding a previous ``session_output``.
+
+    Adapters are restored too, so the six final runs resume properly rather than
+    retraining folds whose weights already exist.
+    """
+    import shutil
+
+    source = Path(source)
+    assert source.exists(), (
+        f"{source} does not exist. Upload the session_output zip as a Kaggle "
+        f"Dataset and point this at its directory, or the sweep starts over.")
+
+    config.ensure_dirs()
+    restored = {}
+    for name in SESSION_ARTIFACTS:
+        found = source / name
+        if not found.exists():
+            continue
+        target = Path(config.RESULTS_DIR) / name
+        if found.is_dir():
+            shutil.copytree(found, target, dirs_exist_ok=True)
+            restored[name] = len(list(found.iterdir()))
+        else:
+            shutil.copy2(found, target)
+            restored[name] = 1
+        log.info("restored %s", name)
+
+    if not restored:
+        log.warning("nothing restored from %s — check the path. Every run will "
+                    "be repeated.", source)
+    return restored
+
+
 def save_history(history: list[dict], run_name: str) -> None:
     """Trainer's log history, for the loss-curve figure."""
     path = config.RESULTS_DIR / "histories"
     path.mkdir(parents=True, exist_ok=True)
     (path / f"{run_name}.json").write_text(json.dumps(history, indent=2))
+
+
+def training_curve(run_name: str) -> dict:
+    """A run's loss trajectory, with the post-restore evaluation removed.
+
+    ``train`` calls ``trainer.evaluate()`` once more after
+    ``load_best_model_at_end`` has restored the best weights, so the final entry
+    in the log history **duplicates the best value** rather than continuing the
+    trajectory. Plotted raw, the curve appears to recover at the end — loss
+    climbing through overfitting and then dropping back — which is the weight
+    restore, not learning.
+
+    Returns train and eval series separately; they are logged at the same steps
+    but the eval series has one extra entry, which is exactly the one to drop.
+    """
+    path = Path(config.RESULTS_DIR) / "histories" / f"{run_name}.json"
+    if not path.exists():
+        return {"train": [], "eval": [], "best": None}
+
+    history = json.loads(path.read_text())
+    train = [(e["epoch"], e["loss"]) for e in history
+             if "loss" in e and "eval_loss" not in e]
+    evals = [(e["epoch"], e["eval_loss"]) for e in history if "eval_loss" in e]
+
+    # Drop the trailing restore evaluation: it repeats an epoch already present
+    # and its value is the minimum by construction.
+    if len(evals) > 1 and evals[-1][1] == min(v for _, v in evals):
+        evals = evals[:-1]
+
+    return {"train": train, "eval": evals,
+            "best": min((v for _, v in evals), default=None)}
 
 
 def append_run(record: dict) -> None:
