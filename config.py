@@ -692,6 +692,20 @@ VALIDATION_MAX_FRACTION: float = 0.20
 EARLY_STOPPING: bool = True
 EARLY_STOPPING_PATIENCE: int = 3
 
+#: How much better an evaluation must be to count as progress.
+#:
+#: EarlyStoppingCallback defaults this to 0.0, which means an improvement of
+#: 0.0001 resets the patience counter — so a run whose validation loss creeps
+#: never accumulates three strikes and burns the entire step budget. Observed:
+#: the unmasked sweep run went 2.383 -> 2.377 -> 2.387 and kept training, while
+#: the n=1000 run, improving in real increments, stopped itself at epoch 4.5 of
+#: 8.9.
+#:
+#: 0.001 is below the smallest difference that would change a conclusion here —
+#: reported perplexities differ by tenths — and above the noise that was keeping
+#: runs alive.
+EARLY_STOPPING_THRESHOLD: float = 0.001
+
 #: Restore the weights from the best validation step rather than the last.
 #: Without this, early stopping SAVES the overfitted model it stopped because
 #: of — the run ends `patience` evaluations past its own best.

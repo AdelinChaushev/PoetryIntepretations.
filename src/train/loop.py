@@ -405,8 +405,12 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         train_dataset=Dataset.from_list(train_set),
         eval_dataset=Dataset.from_list(validation),
         processing_class=tokenizer,
+        # threshold, not just patience: without it any improvement counts,
+        # including 0.0001, so a creeping run resets the counter forever and
+        # spends the whole budget.
         callbacks=([EarlyStoppingCallback(
-            early_stopping_patience=config.EARLY_STOPPING_PATIENCE)]
+            early_stopping_patience=config.EARLY_STOPPING_PATIENCE,
+            early_stopping_threshold=config.EARLY_STOPPING_THRESHOLD)]
             if stopping else []),
     )
 

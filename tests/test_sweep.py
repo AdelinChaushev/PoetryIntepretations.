@@ -19,12 +19,13 @@ def record(name, val_loss, params=737_280, rank=8, lr=2e-4):
 
 # --- the grid -----------------------------------------------------------------
 
-def test_tuning_is_a_product_not_one_at_a_time():
-    """Rank and learning rate interact — alpha/r scaling and lr both control how
-    far the adapter moves per step — so the best rank at one lr need not be the
-    best at another."""
+def test_tuning_is_one_at_a_time_not_a_product():
+    """CLAUDE.md specifies one-at-a-time and says explicitly not to run the full
+    grid. A previous version ran the 3x3 product: 11.6 GPU-hours for tuning
+    alone, which does not fit a 12-hour Kaggle session — and one session was
+    lost to exactly that."""
     grid = sweep.tuning_grid()
-    assert len(grid) == len(config.RANK_SWEEP) * len(config.LR_SWEEP)
+    assert len(grid) == len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
     assert len({(s["rank"], s["learning_rate"]) for s in grid}) == len(grid)
 
 
@@ -107,7 +108,7 @@ def test_run_names_encode_what_varied():
 def test_plan_reports_the_full_size_before_any_gpu_time():
     plan = sweep.plan()
     assert plan["total"] == plan["tuning_runs"] + plan["curve_runs"]
-    assert plan["tuning_runs"] == len(config.RANK_SWEEP) * len(config.LR_SWEEP)
+    assert plan["tuning_runs"] == len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
 
 
 def test_specs_do_not_override_the_global_early_stopping_default():
@@ -291,12 +292,14 @@ def test_csv_numbers_are_coerced_before_selection():
     assert rows[0]["trainable_params"] == 4399104.0
 
 
-def test_the_full_programme_is_19_runs():
+def test_the_full_programme_fits_a_gpu_week():
+    """15 runs, ~15.7 GPU-hours at the measured 4.6 s/step — two sessions inside
+    a 30-hour week. The 19-run version was 20.8 hours and did not finish."""
     from src.train import sweep
 
     plan = sweep.plan()
-    assert plan["total"] == 13
-    assert plan["total"] + len(sweep.final_specs({})) == 19
+    total = plan["total"] + len(sweep.final_specs({}))
+    assert total == 15, f"programme is {total} runs"
 
 
 def test_a_name_match_at_the_wrong_config_is_not_done():
@@ -422,3 +425,44 @@ def test_curve_specs_inherit_an_integer_rank():
     winner = sweep.select_winner(sweep.coerce(as_csv))
     for spec in sweep.reported_curves(winner) + sweep.final_specs(winner):
         assert isinstance(spec["rank"], int), spec
+
+
+def test_tuning_varies_one_axis_at_a_time():
+    """CLAUDE.md specifies one-at-a-time and says explicitly not to run the full
+    grid. A previous version ran the 3x3 product: 11.6 GPU-hours for tuning
+    alone, which does not fit a 12-hour Kaggle session. One session was lost."""
+    from src.train import sweep
+
+    specs = sweep.tuning_grid()
+    assert len(specs) == len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
+
+    # Every spec differs from the default in at most one axis.
+    for spec in specs:
+        varied = sum([spec["rank"] != config.LORA_RANK,
+                      spec["learning_rate"] != config.LEARNING_RATE])
+        assert varied <= 1, spec
+
+
+def test_the_shared_default_is_trained_once():
+    from src.train import sweep
+
+    names = [sweep.run_name(s) for s in sweep.tuning_grid()]
+    assert len(names) == len(set(names))
+
+
+def test_both_sweep_axes_are_still_covered():
+    """Cheaper must not mean incomplete: the rank curve is compared against Hu
+    et al.'s saturation finding and cannot lose a point."""
+    from src.train import sweep
+
+    specs = sweep.tuning_grid()
+    assert {s["rank"] for s in specs} == set(config.RANK_SWEEP)
+    assert {s["learning_rate"] for s in specs} == set(config.LR_SWEEP)
+
+
+def test_batching_bounds_what_a_lost_session_costs():
+    import inspect
+
+    from src.train import sweep
+
+    assert "max_runs" in inspect.signature(sweep.run_stage).parameters

@@ -2,10 +2,15 @@
 
 Two stages, and they answer different kinds of question.
 
-**Stage 1 — tuning.** Rank and learning rate as a full product, because they
-interact: ``alpha/r`` scaling and learning rate both control how far the adapter
-moves per step, so the best rank at one learning rate need not be the best at
-another. Nine runs.
+**Stage 1 — tuning.** Rank and learning rate varied **one at a time**, with the
+other at its default. Five runs.
+
+An earlier version ran the 3x3 product, arguing that the two interact through
+``alpha/r`` scaling. They do — but at ~1.3 hours per full-corpus run that is
+11.6 GPU-hours for tuning alone, and a sweep that cannot finish inside a
+12-hour Kaggle session measures nothing. One session was lost that way. The
+interaction goes in the limitations as unmeasured rather than in the budget as
+unaffordable.
 
 **Stage 2 — reported curves, at the winning config.** Data size and masking are
 not hyperparameters. The final runs use all the data regardless, and masking is
@@ -34,10 +39,36 @@ log = logging.getLogger(__name__)
 
 
 def tuning_grid() -> list[dict]:
-    """The rank x learning-rate product. A grid, not one-at-a-time."""
-    return [{"rank": rank, "learning_rate": lr}
-            for rank in config.RANK_SWEEP
-            for lr in config.LR_SWEEP]
+    """Rank and learning rate, varied **one at a time** with the other at its
+    default.
+
+    Not the 3x3 product. A previous version ran the full grid on the argument
+    that rank and learning rate interact through ``alpha/r`` scaling — which is
+    true, but it costs nine full-corpus runs at ~1.3 hours each, and a session
+    that cannot finish measures nothing at all. CLAUDE.md specifies one-at-a-time
+    and this returns to it.
+
+    The interaction is not lost, only unmeasured, and that belongs in the
+    limitations: a rank that would have won at a different learning rate is not
+    detectable here. The rank axis is reported as a curve against Hu et al.'s
+    saturation finding either way, which is what it was mainly for.
+
+    Duplicates are collapsed: the default rank at the default learning rate
+    appears on both axes and is trained once.
+    """
+    specs, seen = [], set()
+    for rank in config.RANK_SWEEP:
+        specs.append({"rank": rank, "learning_rate": config.LEARNING_RATE})
+    for lr in config.LR_SWEEP:
+        specs.append({"rank": config.LORA_RANK, "learning_rate": lr})
+
+    unique = []
+    for spec in specs:
+        key = (spec["rank"], spec["learning_rate"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(spec)
+    return unique
 
 
 def reported_curves(winner: dict) -> list[dict]:
@@ -200,7 +231,8 @@ def final_specs(winner: dict) -> list[dict]:
 
 def run_stage(specs: list[dict], pairs: list[dict], stage: str,
               save_adapters: bool = False,
-              requires: tuple[str, ...] = ()) -> list[dict]:
+              requires: tuple[str, ...] = (),
+              max_runs: int | None = None) -> list[dict]:
     """Run every spec not already recorded, and return all records for them.
 
     Args:
@@ -230,6 +262,16 @@ def run_stage(specs: list[dict], pairs: list[dict], stage: str,
         return True
 
     pending = [s for s in specs if not usable(s)]
+
+    # Batching exists because `runs.csv` lives in /kaggle/working, which is wiped
+    # when a session ends. A stage that runs for eight hours and is cut off at
+    # the cap loses every row it wrote. Running a few at a time and downloading
+    # between batches bounds the loss to the current batch.
+    if max_runs is not None and len(pending) > max_runs:
+        log.warning("%d run(s) pending; doing %d this batch. DOWNLOAD runs.csv "
+                    "before starting the next one — /kaggle/working does not "
+                    "survive the session.", len(pending), max_runs)
+        pending = pending[:max_runs]
     log.info("%s: %d run(s), %d already recorded, %d to run",
              stage, len(specs), len(specs) - len(pending), len(pending))
 
