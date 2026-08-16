@@ -466,3 +466,45 @@ def test_batching_bounds_what_a_lost_session_costs():
     from src.train import sweep
 
     assert "max_runs" in inspect.signature(sweep.run_stage).parameters
+
+
+# --- tuning is sequential, not independent ------------------------------------
+
+def test_the_rank_sweep_runs_at_the_chosen_learning_rate():
+    """Greedy coordinate descent, not independent one-at-a-time. Sweeping rank
+    around a fixed DEFAULT would draw the rank curve at a configuration the
+    search may already have rejected — the same objection that puts
+    reported_curves at the winner rather than at the defaults."""
+    from src.train import sweep
+
+    chosen = 5e-4
+    assert chosen != config.LEARNING_RATE          # a rate the default is not
+    for spec in sweep.rank_specs(chosen):
+        assert spec["learning_rate"] == chosen
+
+
+def test_the_lr_sweep_covers_every_rate_at_one_rank():
+    from src.train import sweep
+
+    specs = sweep.lr_specs()
+    assert {s["learning_rate"] for s in specs} == set(config.LR_SWEEP)
+    assert {s["rank"] for s in specs} == {config.LORA_RANK}
+
+
+def test_the_shared_point_is_trained_once_across_the_two_stages():
+    """r8 at the winning rate appears in both stages; run_stage must skip the
+    second occurrence or the sweep costs six runs instead of five."""
+    from src.train import sweep
+
+    chosen = 5e-4
+    done = {sweep.run_name(s): {"run": sweep.run_name(s), "rank": s["rank"],
+                                "learning_rate": s["learning_rate"]}
+            for s in sweep.lr_specs()}
+    repeats = [s for s in sweep.rank_specs(chosen) if sweep.already_done(s, done)]
+    assert len(repeats) == 1 and repeats[0]["rank"] == config.LORA_RANK
+
+
+def test_the_sequential_design_costs_no_more_than_independent():
+    from src.train import sweep
+
+    assert len(sweep.tuning_grid()) == len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1

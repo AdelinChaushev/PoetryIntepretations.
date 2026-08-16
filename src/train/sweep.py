@@ -2,8 +2,12 @@
 
 Two stages, and they answer different kinds of question.
 
-**Stage 1 — tuning.** Rank and learning rate varied **one at a time**, with the
-other at its default. Five runs.
+**Stage 1 — tuning, in two sequential passes.** Learning rate first at the
+default rank, then rank at the learning rate that won. Five runs.
+
+Sequential, not independent: sweeping rank around a fixed default would draw the
+rank curve at a configuration the search may already have rejected. Greedy
+coordinate descent costs the same five runs and searches strictly better.
 
 An earlier version ran the 3x3 product, arguing that the two interact through
 ``alpha/r`` scaling. They do — but at ~1.3 hours per full-corpus run that is
@@ -38,37 +42,52 @@ import config
 log = logging.getLogger(__name__)
 
 
-def tuning_grid() -> list[dict]:
-    """Rank and learning rate, varied **one at a time** with the other at its
+def lr_specs() -> list[dict]:
+    """Stage 1a — learning rate, at the default rank.
+
+    Learning rate goes first because ``alpha`` is derived as ``2 * rank``, so
+    ``alpha/r`` is constant across the rank sweep and the effective step size is
+    rank-independent *by construction*. A rate chosen at one rank therefore
+    transfers to the others, which is what makes the sequential design sound
+    rather than merely cheap.
+    """
+    return [{"rank": config.LORA_RANK, "learning_rate": lr}
+            for lr in config.LR_SWEEP]
+
+
+def rank_specs(learning_rate: float) -> list[dict]:
+    """Stage 1b — rank, at the learning rate stage 1a chose.
+
+    **Sequential, not independent.** Sweeping rank at a fixed *default* rate
+    would draw the rank curve at a configuration the search may already have
+    rejected — the same objection that puts `reported_curves` at the winner
+    rather than at the defaults. Running it at the chosen rate costs nothing
+    extra: ``run_stage`` skips the point stage 1a already trained.
+
+    This is greedy coordinate descent. It does not find an interaction the way a
+    full product would, and that stays in the limitations — but for the same
+    five runs it searches strictly better than varying each axis around a fixed
     default.
+    """
+    return [{"rank": rank, "learning_rate": learning_rate}
+            for rank in config.RANK_SWEEP]
 
-    Not the 3x3 product. A previous version ran the full grid on the argument
-    that rank and learning rate interact through ``alpha/r`` scaling — which is
-    true, but it costs nine full-corpus runs at ~1.3 hours each, and a session
-    that cannot finish measures nothing at all. CLAUDE.md specifies one-at-a-time
-    and this returns to it.
 
-    The interaction is not lost, only unmeasured, and that belongs in the
-    limitations: a rank that would have won at a different learning rate is not
-    detectable here. The rank axis is reported as a curve against Hu et al.'s
-    saturation finding either way, which is what it was mainly for.
+def tuning_grid() -> list[dict]:
+    """Every tuning run, for planning and cost estimates only.
 
-    Duplicates are collapsed: the default rank at the default learning rate
-    appears on both axes and is trained once.
+    The stages run separately — :func:`lr_specs`, then :func:`rank_specs` at the
+    winner — because the second depends on the first's result. This flattened
+    view exists so :func:`plan` can report the size before any GPU time is
+    spent, with the duplicate point counted once.
     """
     specs, seen = [], set()
-    for rank in config.RANK_SWEEP:
-        specs.append({"rank": rank, "learning_rate": config.LEARNING_RATE})
-    for lr in config.LR_SWEEP:
-        specs.append({"rank": config.LORA_RANK, "learning_rate": lr})
-
-    unique = []
-    for spec in specs:
+    for spec in lr_specs() + rank_specs(config.LEARNING_RATE):
         key = (spec["rank"], spec["learning_rate"])
         if key not in seen:
             seen.add(key)
-            unique.append(spec)
-    return unique
+            specs.append(spec)
+    return specs
 
 
 def reported_curves(winner: dict) -> list[dict]:
