@@ -325,13 +325,20 @@ def test_csv_numbers_are_coerced_before_selection():
 
 
 def test_the_full_programme_fits_a_gpu_week():
-    """15 runs, ~15.7 GPU-hours at the measured 4.6 s/step — two sessions inside
-    a 30-hour week. The 19-run version was 20.8 hours and did not finish."""
+    """Derived from config, not hardcoded: the sweep has been narrowed once for
+    compute already, and a test that pins a count would break on the next such
+    decision rather than checking the property that matters.
+
+    At ~1.6 GPU-hours per full-corpus run, a 30-hour week bounds the programme
+    at roughly 18 runs. The 19-run version did not finish."""
     from src.train import sweep
 
     plan = sweep.plan()
     total = plan["total"] + len(sweep.final_specs({}))
-    assert total == 15, f"programme is {total} runs"
+    expected = (len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
+                + plan["curve_runs"] + config.N_FOLDS + 1)
+    assert total == expected, f"programme is {total}, expected {expected}"
+    assert total * 1.6 < 30, f"{total} runs is more than a GPU week"
 
 
 def test_a_name_match_at_the_wrong_config_is_not_done():
@@ -509,8 +516,7 @@ def test_the_rank_sweep_runs_at_the_chosen_learning_rate():
     reported_curves at the winner rather than at the defaults."""
     from src.train import sweep
 
-    chosen = 5e-4
-    assert chosen != config.LEARNING_RATE          # a rate the default is not
+    chosen = next(lr for lr in config.LR_SWEEP if lr != config.LEARNING_RATE)
     for spec in sweep.rank_specs(chosen):
         assert spec["learning_rate"] == chosen
 
@@ -528,7 +534,8 @@ def test_the_shared_point_is_trained_once_across_the_two_stages():
     second occurrence or the sweep costs six runs instead of five."""
     from src.train import sweep
 
-    chosen = 5e-4
+    # Whatever 1a picks comes FROM lr_specs, so the shared point always exists.
+    chosen = config.LR_SWEEP[-1]
     done = {sweep.run_name(s): {"run": sweep.run_name(s), "rank": s["rank"],
                                 "learning_rate": s["learning_rate"]}
             for s in sweep.lr_specs()}
@@ -540,3 +547,46 @@ def test_the_sequential_design_costs_no_more_than_independent():
     from src.train import sweep
 
     assert len(sweep.tuning_grid()) == len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
+
+
+def test_selecting_from_an_incomplete_stage_raises(tmp_path, monkeypatch):
+    """Stage 1b sweeps rank AT THE RATE 1a chose, so a partial 1a means the
+    whole rank sweep may sit at a configuration the missing runs would have
+    beaten. This happened: max_runs=2 stopped 1a at two of three rates, the
+    notebook selected from those two, and 1b ran to completion at it."""
+    import csv
+
+    from src.train import sweep
+
+    path = tmp_path / "runs.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["run", "rank", "learning_rate"])
+        writer.writeheader()
+        for lr in list(config.LR_SWEEP)[:-1]:          # one rate short
+            writer.writerow({"run": f"sweep_r{config.LORA_RANK}_lr{lr:g}",
+                             "rank": config.LORA_RANK, "learning_rate": lr})
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+
+    try:
+        sweep.assert_stage_complete(sweep.lr_specs(), "stage 1a")
+    except AssertionError as error:
+        assert "incomplete" in str(error)
+        return
+    raise AssertionError("selection was allowed from a partial stage")
+
+
+def test_a_complete_stage_passes(tmp_path, monkeypatch):
+    import csv
+
+    from src.train import sweep
+
+    path = tmp_path / "runs.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["run", "rank", "learning_rate"])
+        writer.writeheader()
+        for spec in sweep.lr_specs():
+            writer.writerow({"run": sweep.run_name(spec), "rank": spec["rank"],
+                             "learning_rate": spec["learning_rate"]})
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+
+    sweep.assert_stage_complete(sweep.lr_specs(), "stage 1a")   # must not raise

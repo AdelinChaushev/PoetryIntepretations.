@@ -70,3 +70,7 @@ venv/
 # Claude Code — local tooling, not part of the deliverable
 .claude/
 CLAUDE.md
+
+# Transfer archives — their contents are already extracted alongside them.
+results/session_output*.zip
+results/to_download/

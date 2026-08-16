@@ -745,7 +745,22 @@ CHECKPOINT_EVERY_STEPS: int = 250
 #: interact, while data size and masking are single-axis because neither is a
 #: hyperparameter being tuned.
 RANK_SWEEP: tuple[int, ...] = (4, 8, 16)
-LR_SWEEP: tuple[float, ...] = (1e-4, 2e-4, 5e-4)
+#: NARROWED from (1e-4, 2e-4, 5e-4) on 2026-08-16, for two reasons stated
+#: together because neither alone would justify it.
+#:
+#: Compute: a full-corpus run costs ~1.6 GPU-hours, a session was lost to a
+#: 12-hour cap, and the six final runs — which everything downstream needs —
+#: had not started. The third rate was the affordable thing to drop.
+#:
+#: Evidence: the two rates measured differ by 2x and produced validation losses
+#: identical to the seventh decimal (1.6148772 vs 1.6148783), with gradient
+#: clipping already active at the lower one. The objective is flat across this
+#: range, so a third point was unlikely to separate.
+#:
+#: **The cost is real and belongs in the limitations**: the highest rate was
+#: never tried, so the selected rate is the best of two rather than of three,
+#: and a better rate above the range explored cannot be ruled out.
+LR_SWEEP: tuple[float, ...] = (1e-4, 2e-4)
 
 #: How much training data changes what fine-tuning achieves. ``None`` is the
 #: full surviving corpus, whatever size that turns out to be.

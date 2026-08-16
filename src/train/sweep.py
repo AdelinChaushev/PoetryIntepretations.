@@ -120,6 +120,29 @@ def run_name(spec: dict) -> str:
     return "sweep_" + "_".join(parts)
 
 
+def assert_stage_complete(specs: list[dict], stage: str = "stage") -> None:
+    """Every run in a stage must be recorded before its result is used.
+
+    **The sequential design has a dependency that nothing else enforces.**
+    Stage 1b sweeps rank *at the rate stage 1a chose*, so selecting from a
+    partial 1a and proceeding runs the whole rank sweep at a rate that may not
+    survive the missing runs — and if it does not, every 1b result is at the
+    wrong configuration and must be repeated.
+
+    This happened: ``max_runs=2`` stopped 1a at two of three learning rates, the
+    notebook selected a winner from those two, and 1b ran to completion at it.
+    Nothing raised, because a partial stage and a complete one look identical to
+    ``select_winner`` — it minimises over whatever it is handed.
+    """
+    done = load_completed()
+    missing = [run_name(s) for s in specs if not already_done(s, done)]
+    assert not missing, (
+        f"{stage} is incomplete: {missing} not recorded. Selecting now would "
+        f"choose from a partial sweep, and anything run at that choice would "
+        f"have to be repeated if a missing run turns out to win. Finish the "
+        f"stage first — run_stage skips what is already done.")
+
+
 def select_winner(records: list[dict]) -> dict:
     """The best run by the pre-registered metric.
 
