@@ -197,6 +197,100 @@ def select_winner(records: list[dict]) -> dict:
             "learning_rate": float(best["learning_rate"])}
 
 
+# --- cross-validated tuning ---------------------------------------------------
+#
+# CV belongs here and nowhere else. Its job is to stop a hyperparameter choice
+# being hostage to one slice of authors. It is NOT a way to define held-out
+# data: applied to the test partition it produces k models where one is wanted,
+# and LoRA adapters trained on different data cannot be merged into a single
+# artefact.
+
+def cv_run_name(spec: dict, fold: int) -> str:
+    """Name for one (configuration, fold) tuning run."""
+    return f"cv_r{spec['rank']}_lr{spec['learning_rate']:g}_f{fold}"
+
+
+def cv_specs(k: int | None = None) -> list[dict]:
+    """Every (configuration, fold) pair the tuning stage will run.
+
+    Configurations vary one axis at a time — rank at the default rate, then rate
+    at the default rank, with the shared point counted once. The product would
+    be more thorough and costs k runs per cell rather than k per config, which
+    at 1.3 hours a run does not fit a GPU week.
+    """
+    folds = config.TUNING_FOLDS if k is None else k
+    return [{**spec, "fold": fold, "run": cv_run_name(spec, fold)}
+            for spec in tuning_grid()
+            for fold in range(folds)]
+
+
+def select_winner_cv(records: list[dict]) -> dict:
+    """The configuration with the best **mean** validation loss across folds.
+
+    Averaging is the entire point of cross-validating a hyperparameter choice.
+    Taking the single best fold would select the luckiest slice of authors —
+    exactly the fragility CV exists to remove — and with three folds per config
+    the best-of-three is a noticeably optimistic estimate.
+
+    A configuration missing any of its folds is excluded rather than averaged
+    over what happens to be present, since a mean of two is not comparable with
+    a mean of three.
+    """
+    metric = config.SWEEP_SELECTION_METRIC
+    assert "heldout" not in metric, (
+        f"SWEEP_SELECTION_METRIC is {metric!r}; selecting on held-out data "
+        f"turns the test set into a validation set")
+
+    grouped: dict = {}
+    for row in records:
+        if row.get(metric) in (None, "", "None"):
+            continue
+        if str(row.get("smoke", "")).lower() in ("true", "1"):
+            continue
+        if row.get("model", config.MODEL) != config.MODEL:
+            continue
+        key = (int(float(row["rank"])), float(row["learning_rate"]))
+        grouped.setdefault(key, []).append(float(row[metric]))
+
+    expected = config.TUNING_FOLDS
+    complete = {k: v for k, v in grouped.items() if len(v) == expected}
+    partial = {k: len(v) for k, v in grouped.items() if len(v) != expected}
+    if partial:
+        log.warning("excluded %d configuration(s) missing folds: %s",
+                    len(partial), partial)
+
+    assert complete, (
+        f"no configuration has all {expected} folds recorded; "
+        f"found {[(k, len(v)) for k, v in grouped.items()]}")
+
+    sign = 1 if config.SWEEP_SELECTION_LOWER_IS_BETTER else -1
+    means = {k: sum(v) / len(v) for k, v in complete.items()}
+    # Ties break toward the smaller rank, the direction Hu et al.'s saturation
+    # finding predicts, so the tiebreak cannot quietly favour the outcome.
+    best = min(means, key=lambda k: (sign * means[k], k[0]))
+
+    log.info("CV winner: rank %d, lr %g — mean %s %.4f over %d folds",
+             best[0], best[1], metric, means[best], expected)
+    for key in sorted(means, key=lambda k: sign * means[k]):
+        log.info("    r%-3d lr%-8g mean %.4f  (folds: %s)", key[0], key[1],
+                 means[key], ", ".join(f"{v:.4f}" for v in complete[key]))
+    return {"rank": best[0], "learning_rate": best[1]}
+
+
+def final_spec(winner: dict) -> dict:
+    """The one model the results are reported from.
+
+    Trained on the whole pool minus a validation slice, then measured once on
+    the test set. Named ``lora_r{rank}`` with no fold suffix, because there is
+    exactly one — which is what the README's load snippet promises and what the
+    fold design could not provide.
+    """
+    rank = int(winner["rank"])
+    return {"rank": rank,
+            "learning_rate": float(winner["learning_rate"]),
+            "run": f"lora_r{rank}"}
+
+
 def load_completed() -> dict:
     """Run name -> the row ``runs.csv`` recorded for it.
 
@@ -304,17 +398,24 @@ def run_stage(specs: list[dict], pairs: list[dict], stage: str,
 
     pending = [s for s in specs if not usable(s)]
 
-    # Batching exists because `runs.csv` lives in /kaggle/working, which is wiped
-    # when a session ends. A stage that runs for eight hours and is cut off at
-    # the cap loses every row it wrote. Running a few at a time and downloading
-    # between batches bounds the loss to the current batch.
+    # Counted BEFORE the batch limit is applied. Reporting after it made
+    # `len(specs) - len(pending)` treat the untouched remainder as finished
+    # work: with 3 of 6 recorded and max_runs=1 it announced "5 already
+    # recorded, 1 to run", which reads as almost done rather than half done.
+    recorded = len(specs) - len(pending)
+
+    # Batching exists because RESULTS_DIR does not survive a session on either
+    # Kaggle or Colab. A stage that runs for hours and is cut off loses every
+    # row it wrote; running a few at a time bounds that to the current batch.
     if max_runs is not None and len(pending) > max_runs:
-        log.warning("%d run(s) pending; doing %d this batch. DOWNLOAD runs.csv "
-                    "before starting the next one — /kaggle/working does not "
-                    "survive the session.", len(pending), max_runs)
+        log.warning("%d pending; doing %d this batch. Archive %s before "
+                    "starting the next one — it does not survive the session.",
+                    len(pending), max_runs, config.RUNS_CSV_PATH.name)
         pending = pending[:max_runs]
-    log.info("%s: %d run(s), %d already recorded, %d to run",
-             stage, len(specs), len(specs) - len(pending), len(pending))
+
+    log.info("%s: %d run(s), %d already recorded, %d still to run, "
+             "%d in this batch", stage, len(specs), recorded,
+             len(specs) - recorded, len(pending))
 
     for index, spec in enumerate(pending, 1):
         name = spec.get("run") or run_name(spec)
@@ -417,6 +518,114 @@ def run_one(spec: dict, pairs: list[dict], fold: int | None = None,
         # reports a comparison that never happened.
         masking=spec.get("masking", "masked"),
     )
+
+
+def run_cv_fold(spec: dict, pairs: list[dict], save_adapter: bool = True):
+    """One tuning run: train on the other tuning folds, score on this one.
+
+    Everything is rebuilt per run — model, adapters, optimiser — because an
+    adapter carried between runs would make each a continuation of the last
+    rather than an independent configuration.
+    """
+    from src.data import splits
+    from src.model import setup
+    from src.train import dataset, loop
+
+    fold = spec["fold"]
+    rank = int(spec["rank"])
+    setup.assert_matched_learning_rate("lora", spec["learning_rate"])
+
+    train_pairs, held_pairs = splits.tuning_partition(pairs, fold)
+
+    tokenizer = setup.load_tokenizer()
+    model = setup.apply_lora(setup.load_base_model(), rank=rank)
+
+    return loop.train(
+        model, tokenizer, dataset.build_dataset(train_pairs, tokenizer), pairs,
+        run_name=spec["run"],
+        fold=fold,
+        save_adapter=save_adapter,
+        # This fold's held-out poems, not the test set. Tuning never touches the
+        # test set — splits.assert_tuning_never_sees_test checked that before
+        # the split was written to disk.
+        heldout=dataset.build_dataset(held_pairs, tokenizer),
+        early_stopping=spec.get("early_stopping"),
+        rank=rank,
+        learning_rate=spec["learning_rate"],
+        masking=spec.get("masking", "masked"),
+    )
+
+
+def run_final(spec: dict, pairs: list[dict], save_adapter: bool = True):
+    """The one model the results are reported from.
+
+    Trains on the pool minus a validation slice, and is measured **once** on the
+    test set — the only time any model sees it.
+
+    The validation slice is drawn from authors the tuning stage never used, so
+    the stopping point is not selected on data whose hyperparameters were also
+    selected on it.
+    """
+    from src.data import splits
+    from src.model import setup
+    from src.train import dataset, loop
+
+    rank = int(spec["rank"])
+    setup.assert_matched_learning_rate("lora", spec["learning_rate"])
+
+    pool = splits.pool_partition(pairs)
+    test = splits.test_partition(pairs)
+    assert not ({p["poem_id"] for p in pool} & {p["poem_id"] for p in test}), (
+        "the pool and the test set overlap — this run would train on the data "
+        "it is about to be measured by")
+
+    tokenizer = setup.load_tokenizer()
+    model = setup.apply_lora(setup.load_base_model(), rank=rank)
+
+    return loop.train(
+        model, tokenizer, dataset.build_dataset(pool, tokenizer), pairs,
+        run_name=spec["run"],
+        save_adapter=save_adapter,
+        heldout=dataset.build_dataset(test, tokenizer),
+        prefer_unused=splits.untouched_authors(pairs),
+        early_stopping=spec.get("early_stopping"),
+        rank=rank,
+        learning_rate=spec["learning_rate"],
+        masking=spec.get("masking", "masked"),
+    )
+
+
+def run_cv_stage(pairs: list[dict], max_runs: int | None = None) -> list[dict]:
+    """Run every (configuration, fold) tuning run not already recorded."""
+    import csv
+    from pathlib import Path
+
+    specs = cv_specs()
+    done = load_completed()
+    pending = [s for s in specs if s["run"] not in done]
+    recorded = len(specs) - len(pending)
+
+    if max_runs is not None and len(pending) > max_runs:
+        log.warning("%d pending; doing %d this batch. Archive %s before the "
+                    "next one — it does not survive the session.",
+                    len(pending), max_runs, config.RUNS_CSV_PATH.name)
+        pending = pending[:max_runs]
+
+    log.info("tuning: %d run(s), %d already recorded, %d still to run, "
+             "%d in this batch", len(specs), recorded, len(specs) - recorded,
+             len(pending))
+
+    for index, spec in enumerate(pending, 1):
+        log.info("[tuning %d/%d] %s", index, len(pending), spec["run"])
+        run_cv_fold(spec, pairs)
+
+    path = Path(config.RUNS_CSV_PATH)
+    if not path.exists():
+        return []
+    wanted = {s["run"] for s in specs}
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = [r for r in csv.DictReader(handle) if r["run"] in wanted]
+    return list({r["run"]: r for r in rows}.values())
 
 
 def plan() -> dict:

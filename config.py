@@ -107,6 +107,33 @@ TRAINING_PAIRS_PATH: Path = DATA_DIR / "training_pairs.jsonl"
 #: them invites shipping a stale half.
 FOLD_ASSIGNMENT_PATH: Path = DATA_DIR / "folds.json"
 
+#: The OUTER split that replaces the fold scheme: one author-disjoint test set
+#: fixed before any hyperparameter is chosen, plus the pool everything else
+#: trains on.
+#:
+#: A separate file from folds.json rather than an overwrite. The fold-based
+#: runs, their adapters and the first contamination probe all key on the old
+#: evaluation ids, and the report shows both designs — why 5-fold was chosen,
+#: what it cost, and why a single holdout replaced it. Overwriting would make
+#: that comparison unreproducible.
+HOLDOUT_PATH: Path = DATA_DIR / "holdout.json"
+
+#: Poems in the test set. 150 keeps the judge budget identical to the fold
+#: design (150 x 5 arms x 3 conditions x 2 judges), so the two are comparable.
+#: The realised size is slightly larger because whole authors are taken.
+TEST_SIZE: int = 150
+
+#: Folds used for hyperparameter tuning ONLY — never to define held-out data.
+#: Three rather than five: tuning costs k runs per configuration, and five
+#: would be 26 GPU-hours before the final model exists.
+TUNING_FOLDS: int = 3
+
+#: Poems the tuning folds are built over. Capped because tuning cost scales
+#: with it, and hyperparameter *rankings* are more stable across data scale
+#: than absolute losses are. A real approximation, and it belongs in the
+#: writeup rather than a footnote.
+TUNING_SUBSAMPLE: int = 1000
+
 def _result(name: str) -> Path:
     """A results path that smoke runs cannot contaminate.
 

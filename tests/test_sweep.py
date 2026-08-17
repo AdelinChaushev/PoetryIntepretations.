@@ -590,3 +590,33 @@ def test_a_complete_stage_passes(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
 
     sweep.assert_stage_complete(sweep.lr_specs(), "stage 1a")   # must not raise
+
+
+def test_the_batch_limit_does_not_inflate_the_recorded_count(caplog, tmp_path,
+                                                             monkeypatch):
+    """Counting after the truncation treated the untouched remainder as
+    finished: with 3 of 6 recorded and max_runs=1 the log announced "5 already
+    recorded, 1 to run", which reads as almost done rather than half done."""
+    import csv
+    import logging
+
+    from src.train import sweep
+
+    path = tmp_path / "runs.csv"
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["run", "rank",
+                                                    "learning_rate"])
+        writer.writeheader()
+        for fold in range(3):                       # 3 of the 6 final runs
+            writer.writerow({"run": f"lora_r8_fold{fold}", "rank": 8,
+                             "learning_rate": 1e-4})
+    monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
+    monkeypatch.setattr(sweep, "run_one", lambda *a, **k: None)
+
+    with caplog.at_level(logging.INFO):
+        sweep.run_stage(sweep.final_specs({"learning_rate": 1e-4}), [],
+                        stage="final", max_runs=1)
+
+    line = next(m for m in caplog.messages if "already recorded" in m)
+    assert "3 already recorded" in line, line
+    assert "3 still to run" in line, line

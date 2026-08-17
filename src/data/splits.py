@@ -197,7 +197,171 @@ def sample_eval_poems(
     return selected
 
 
+def holdout_split(corpus: list[dict], test_size: int,
+                  min_poems_per_author: int = 2, seed: int = 0,
+                  exclude: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
+    """Author-disjoint OUTER split: a test set no model ever sees.
+
+    Returns ``(test, pool)``. The pool is everything else, and the final model
+    trains on it with its own validation slice carved out — so the arrangement
+    is train / validation / test with the test partition fixed once, before any
+    hyperparameter is chosen.
+
+    **Small authors first, and that is the whole trick.** The evaluation set
+    must be author-disjoint, or a model trained on 271 Dickinson poems is asked
+    to interpret a 272nd and the swap test's author-prior control is doing all
+    the work. But 16 prolific authors own 66% of this corpus, so holding *those*
+    out to reach 150 test poems would leave 34% to train on. Taking the smallest
+    eligible authors instead reaches the same 150 while leaving ~94%.
+
+    ``min_poems_per_author`` is not negotiable: the swap test needs a different
+    poem by the same author for every test poem, and an author contributing one
+    poem cannot supply it. Authors below the threshold stay in the pool.
+
+    Deterministic given ``(corpus, test_size, seed)`` — authors are ordered by
+    size then name, so the split reproduces on any machine. That matters because
+    the test set is quoted in the report and probed for contamination; it cannot
+    drift between runs.
+    """
+    excluded_authors = {poem["author"] for poem in (exclude or [])}
+    by_author: dict[str, list[dict]] = collections.defaultdict(list)
+    for poem in corpus:
+        if poem["author"] not in excluded_authors:
+            by_author[poem["author"]].append(poem)
+
+    eligible = sorted(
+        ((len(poems), author) for author, poems in by_author.items()
+         if len(poems) >= min_poems_per_author),
+        key=lambda pair: (pair[0], pair[1]),
+    )
+
+    test_authors: set[str] = set()
+    held = 0
+    for count, author in eligible:
+        if held >= test_size:
+            break
+        test_authors.add(author)
+        held += count
+
+    assert held >= test_size, (
+        f"only {held} poems available from authors with >= "
+        f"{min_poems_per_author} poems; {test_size} needed for the test set")
+
+    test = sorted((p for p in corpus if p["author"] in test_authors),
+                  key=lambda p: p["poem_id"])
+    pool = sorted((p for p in corpus if p["author"] not in test_authors),
+                  key=lambda p: p["poem_id"])
+
+    log.info("holdout: %d test poems from %d authors, %d in the pool (%.0f%%)",
+             len(test), len(test_authors), len(pool),
+             100 * len(pool) / len(corpus))
+    return test, pool
+
+
+def tuning_folds(pool: list[dict], k: int, subsample: int | None = None,
+                 seed: int = 0) -> Folds:
+    """Grouped k-fold over the pool, for **hyperparameter selection only**.
+
+    Cross-validation belongs here rather than around the test set. Its job is to
+    keep a hyperparameter choice from being hostage to one slice of authors; it
+    is not a way to define held-out data, and using it that way produces k
+    models where one is wanted.
+
+    ``subsample`` caps the poems used, because tuning cost is ``k`` runs per
+    configuration and the full pool makes that unaffordable. Hyperparameter
+    *rankings* are more stable across data scale than absolute losses are, so a
+    subsample buys the ranking cheaply — but it is a real approximation and
+    belongs in the writeup rather than in a footnote.
+    """
+    selected = pool
+    if subsample is not None and subsample < len(pool):
+        rng = random.Random(seed)
+        authors = sorted({poem["author"] for poem in selected})
+        rng.shuffle(authors)
+
+        # Whole authors, so the subsample stays author-disjoint like the folds
+        # built over it.
+        taken, chosen = 0, set()
+        for author in authors:
+            if taken >= subsample:
+                break
+            chosen.add(author)
+            taken += sum(1 for p in pool if p["author"] == author)
+        selected = [p for p in pool if p["author"] in chosen]
+        log.info("tuning on a %d-poem subsample of the %d-poem pool",
+                 len(selected), len(pool))
+
+    return make_folds(selected, k=k, seed=seed)
+
+
 # --- assertions ------------------------------------------------------------
+
+def assert_holdout_disjoint(test: list[dict], pool: list[dict],
+                            exemplars: list[dict] | None = None) -> None:
+    """The outer split holds, by author and by poem.
+
+    Author disjointness is the load-bearing half. A poem-level split would leave
+    271 Dickinson poems in training and 27 in test, and the model could write a
+    fluent Dickinson interpretation without reading the poem in front of it —
+    which is precisely what the swap test's same-author condition exists to
+    detect, so the headline grounding gap would be measuring the leak.
+    """
+    test_ids = {p["poem_id"] for p in test}
+    pool_ids = {p["poem_id"] for p in pool}
+    assert not (test_ids & pool_ids), (
+        f"{len(test_ids & pool_ids)} poems are in BOTH test and pool")
+
+    test_authors = {p["author"] for p in test}
+    pool_authors = {p["author"] for p in pool}
+    shared = test_authors & pool_authors
+    assert not shared, (
+        f"{len(shared)} author(s) appear in both test and pool: "
+        f"{sorted(shared)[:5]}. The model would train on their other poems and "
+        f"could interpret a test poem from author priors alone.")
+
+    if exemplars:
+        ex_ids = {p["poem_id"] for p in exemplars}
+        ex_authors = {p["author"] for p in exemplars}
+        assert not (ex_ids & test_ids), (
+            "a few-shot exemplar is also a test poem — base_few would be shown "
+            "the answer in its own prompt")
+        assert not (ex_authors & test_authors), (
+            f"exemplar author(s) {sorted(ex_authors & test_authors)} also "
+            f"supply test poems, leaking their themes through the prompt")
+
+
+def assert_test_has_siblings(test: list[dict],
+                             min_poems_per_author: int = 2) -> None:
+    """Every test poem has a different poem by the same author.
+
+    Without one the swap test cannot build its ``mismatched_same_author``
+    condition, and that condition is the only control catching a model that
+    recognises the author rather than reading the poem.
+    """
+    counts = collections.Counter(p["author"] for p in test)
+    orphans = [p["poem_id"] for p in test
+               if counts[p["author"]] < min_poems_per_author]
+    assert not orphans, (
+        f"{len(orphans)} test poems have no same-author sibling "
+        f"({orphans[:5]}), so the strict swap condition is not computable "
+        f"for them")
+
+
+def assert_tuning_never_sees_test(folds: Folds, test: list[dict]) -> None:
+    """No tuning fold contains a test poem.
+
+    Hyperparameters chosen with the test set in view make every number reported
+    from it optimistic — the same selection bias measured at +11% between
+    validation and held-out perplexity, but applied to the headline result.
+    """
+    test_ids = {p["poem_id"] for p in test}
+    for index, group in enumerate(folds.held_out):
+        leaked = {p["poem_id"] for p in group} & test_ids
+        assert not leaked, (
+            f"tuning fold {index} contains {len(leaked)} test poems "
+            f"({sorted(leaked)[:5]}) — the hyperparameter choice would be "
+            f"informed by the data the result is reported from")
+
 
 def assert_partition_complete(folds: Folds, corpus: list[dict],
                               exclude: list[dict] | None = None) -> None:
@@ -348,6 +512,140 @@ def save(folds: Folds, eval_set: list[dict], exemplars: list[dict],
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     log.info("training pairs written to %s (%d records)",
              config.TRAINING_PAIRS_PATH, len(pairs))
+
+
+def save_holdout(test: list[dict], pool: list[dict], exemplars: list[dict],
+                 tuning: Folds) -> None:
+    """Write the outer split, in one call, after every assertion has passed.
+
+    Written to :data:`config.HOLDOUT_PATH` rather than over ``folds.json``. The
+    fold-based runs, their adapters and the first contamination probe all key on
+    the old evaluation ids, and the report shows both designs — overwriting
+    would make that comparison unreproducible.
+
+    The tuning fold assignment is recorded too, so a reader can verify no test
+    poem entered hyperparameter selection rather than taking it on trust.
+    """
+    assert_holdout_disjoint(test, pool, exemplars)
+    assert_test_has_siblings(test)
+    assert_tuning_never_sees_test(tuning, test)
+
+    payload = {
+        "seed": config.SEED,
+        "test_size_requested": config.TEST_SIZE,
+        "group_key": config.FOLD_GROUP_KEY,
+        "test_poem_ids": sorted(p["poem_id"] for p in test),
+        "pool_poem_ids": sorted(p["poem_id"] for p in pool),
+        "exemplar_poem_ids": [p["poem_id"] for p in exemplars],
+        "tuning_k": tuning.k,
+        "tuning_subsample": config.TUNING_SUBSAMPLE,
+        "tuning_fold_of": {p["poem_id"]: i
+                           for i, group in enumerate(tuning.held_out)
+                           for p in group},
+    }
+    config.HOLDOUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.HOLDOUT_PATH.write_text(json.dumps(payload, indent=2))
+    log.info("holdout written to %s: %d test, %d pool, %d in tuning folds",
+             config.HOLDOUT_PATH, len(test), len(pool),
+             len(payload["tuning_fold_of"]))
+
+
+def load_holdout() -> dict:
+    """Read the outer split as sets of ints, or empty if it does not exist.
+
+    Keys are ints. JSON stringifies them, and a lookup with the wrong type
+    returns nothing — which every caller would read as "not in the test set"
+    and quietly train on it.
+    """
+    if not config.HOLDOUT_PATH.exists():
+        return {}
+    saved = json.loads(config.HOLDOUT_PATH.read_text(encoding="utf-8"))
+    return {
+        "test": {int(i) for i in saved.get("test_poem_ids", [])},
+        "pool": {int(i) for i in saved.get("pool_poem_ids", [])},
+        "exemplars": [int(i) for i in saved.get("exemplar_poem_ids", [])],
+        "tuning_fold_of": {int(k): v
+                           for k, v in saved.get("tuning_fold_of", {}).items()},
+        "tuning_k": saved.get("tuning_k"),
+    }
+
+
+def test_partition(pairs: list[dict]) -> list[dict]:
+    """The poems no model may ever train on."""
+    holdout = load_holdout()
+    assert holdout, (
+        f"no holdout at {config.HOLDOUT_PATH}. Without it every poem looks "
+        f"trainable, including the ones results are reported from.")
+    return [p for p in pairs if p["poem_id"] in holdout["test"]]
+
+
+def pool_partition(pairs: list[dict]) -> list[dict]:
+    """Everything the final model may train on — the corpus minus the test set.
+
+    Asserts the filter removed something, for the same reason
+    :func:`training_partition` does: a mapping that fails to load leaves every
+    poem eligible, and the run trains on the data it is later judged by.
+    """
+    holdout = load_holdout()
+    assert holdout, (
+        f"no holdout at {config.HOLDOUT_PATH}; refusing to treat the whole "
+        f"corpus as trainable")
+
+    pool = [p for p in pairs if p["poem_id"] not in holdout["test"]]
+    assert len(pool) < len(pairs), (
+        f"filtering removed nothing from {len(pairs)} pairs — either the "
+        f"holdout does not cover them or the poem_id types disagree. This run "
+        f"would train on its own test set.")
+    log.info("pool: %d of %d pairs (%d held out as test)",
+             len(pool), len(pairs), len(pairs) - len(pool))
+    return pool
+
+
+def tuning_partition(pairs: list[dict], fold: int) -> tuple[list[dict], list[dict]]:
+    """Training and held-out poems for one tuning fold.
+
+    Returns ``(train, held_out)``. Both come from the tuning subsample, which is
+    itself drawn from the pool — so nothing here has ever touched the test set,
+    and :func:`assert_tuning_never_sees_test` checked that before the split was
+    written.
+
+    Cross-validation lives here and nowhere else. Its job is to keep a
+    hyperparameter choice from being hostage to one slice of authors; it does
+    not define held-out data, and using it that way produces k models where one
+    is wanted.
+    """
+    holdout = load_holdout()
+    assert holdout, (
+        f"no holdout at {config.HOLDOUT_PATH}; cannot resolve tuning folds")
+
+    mapping = holdout["tuning_fold_of"]
+    assert mapping, "the holdout records no tuning folds"
+
+    train = [p for p in pairs if mapping.get(p["poem_id"], -1) not in (-1, fold)]
+    held = [p for p in pairs if mapping.get(p["poem_id"]) == fold]
+
+    assert train and held, (
+        f"tuning fold {fold} produced {len(train)} train / {len(held)} held out "
+        f"— either the fold number is out of range or the poem_id types "
+        f"disagree with the saved mapping")
+    log.info("tuning fold %d: %d train, %d held out", fold, len(train), len(held))
+    return train, held
+
+
+def untouched_authors(pairs: list[dict]) -> set:
+    """Pool authors the tuning stage never used.
+
+    The final model's validation slice is drawn from these, so its stopping
+    point is not selected on data whose hyperparameters were also selected on
+    it — passed to :func:`loop.split_validation` as ``prefer_unused``.
+    """
+    holdout = load_holdout()
+    if not holdout:
+        return set()
+    tuned = holdout["tuning_fold_of"]
+    pool_authors = {p["author"] for p in pairs if p["poem_id"] in holdout["pool"]}
+    used = {p["author"] for p in pairs if p["poem_id"] in tuned}
+    return pool_authors - used
 
 
 def load_training_pairs() -> list[dict]:

@@ -67,7 +67,8 @@ def perplexity(loss: float) -> float:
 
 
 def split_validation(examples: list[dict], pairs: list[dict],
-                     fraction: float = 0.1, seed: int | None = None):
+                     fraction: float = 0.1, seed: int | None = None,
+                     prefer_unused: set | None = None):
     """Hold back a validation slice, **grouped by author**.
 
     Custom because no library does it: a random 10% would put Dickinson on both
@@ -97,8 +98,17 @@ def split_validation(examples: list[dict], pairs: list[dict],
     target = max(1, int(len(examples) * fraction))
     ceiling = max(target, int(len(examples) * config.VALIDATION_MAX_FRACTION))
 
+    # Authors the tuning stage never touched are preferred, so the stopping
+    # point is not selected on data whose hyperparameters were also selected on
+    # it. That double-use is mild — it flatters the validation number, not the
+    # test number — but 1,380 pool poems sit outside the tuning subsample, so
+    # avoiding it costs nothing.
+    def preference(author: str) -> tuple:
+        unused = prefer_unused is None or author in prefer_unused
+        return (0 if unused else 1, len(per_author.get(author, [])), author)
+
     held, count = set(), 0
-    for author in sorted(authors, key=lambda a: len(per_author.get(a, []))):
+    for author in sorted(authors, key=preference):
         size = len(per_author.get(author, []))
         if count >= target or count + size > ceiling:
             continue
@@ -328,7 +338,8 @@ def base_perplexity(pairs: list[dict], model, tokenizer,
 def train(model, tokenizer, examples: list[dict], pairs: list[dict],
           run_name: str, max_steps: int | None = None,
           early_stopping: bool | None = None, fold: int | None = None,
-          save_adapter: bool = True, **overrides) -> dict:
+          save_adapter: bool = True, heldout: list[dict] | None = None,
+          prefer_unused: set | None = None, **overrides) -> dict:
     """Train one adapter. Returns the run record written to ``runs.csv``.
 
     Pass ``fold`` to have the adapter written here, in the same call that
@@ -388,7 +399,8 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         f"on one card and the batch is too small to split usefully.")
 
     stopping = config.EARLY_STOPPING if early_stopping is None else early_stopping
-    train_set, validation = split_validation(examples, pairs)
+    train_set, validation = split_validation(examples, pairs,
+                                             prefer_unused=prefer_unused)
     steps = max_steps or config.steps_for(len(train_set))
     effective = config.BATCH_SIZE * config.GRAD_ACCUM_STEPS
 
@@ -458,11 +470,16 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         "n_heldout": 0,
     }
 
-    if fold is not None:
+    if fold is not None or heldout is not None:
         # The perplexity model selection never touched. Measured AFTER
         # load_best_model_at_end has restored the best weights, so it describes
         # the adapter that actually ships rather than the one the run stopped on.
-        held = heldout_examples(pairs, fold, tokenizer)
+        # Explicit when the caller knows the set — the tuning folds and the
+        # final test partition both come from holdout.json, which this module
+        # deliberately knows nothing about. Falls back to the fold-derived
+        # version so the older fold-based path still works.
+        held = (heldout if heldout is not None
+                else heldout_examples(pairs, fold, tokenizer))
         metrics = evaluate_perplexity(trainer.model, tokenizer, held,
                                       label=f"{run_name}_heldout")
         record.update(heldout_loss=metrics["loss"],

@@ -25,6 +25,11 @@ data/*
 !data/interpretations.jsonl
 !data/raw_poems.jsonl
 !data/folds.json
+# The outer split: test ids, pool ids, tuning folds. Committed for the same
+# reason as folds.json — it is computed once locally and shipped to the GPU
+# side as data, and recomputing it there with a different seed would break the
+# held-out guarantee without raising anything.
+!data/holdout.json
 # training_pairs.jsonl (6.2 MB) is derived from the two above, so it looks
 # redundant — but it is the file Kaggle trains on, and CLAUDE.md forbids
 # rebuilding it there: the funnel is a pure function of the raw files AND the
