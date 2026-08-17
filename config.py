@@ -32,9 +32,26 @@ from typing import NamedTuple
 
 SMOKE: bool = os.getenv("SMOKE", "0") == "1"
 
-#: True inside a Kaggle notebook session. Kaggle sets KAGGLE_KERNEL_RUN_TYPE;
-#: the directory check is a fallback for cases where it is absent.
-IS_KAGGLE: bool = bool(os.getenv("KAGGLE_KERNEL_RUN_TYPE")) or Path("/kaggle").is_dir()
+def _detect_kaggle() -> bool:
+    """True only inside a real Kaggle session.
+
+    The environment variable is the reliable signal. The directory fallback
+    exists for sessions that do not set it, but it must name the *writable
+    working directory* rather than ``/kaggle`` alone — a bare ``/kaggle`` can
+    exist elsewhere, and on Colab it does. That misdetection sent DATA_DIR to
+    ``/kaggle/input`` and RESULTS_DIR to ``/kaggle/working`` on a machine where
+    neither exists, so the corpus read as empty and the sweep reported zero
+    recorded runs while the files sat in the checkout.
+
+    Both paths must be present: Kaggle always mounts them together.
+    """
+    if os.getenv("KAGGLE_KERNEL_RUN_TYPE"):
+        return True
+    return Path("/kaggle/working").is_dir() and Path("/kaggle/input").is_dir()
+
+
+#: Detected, never set by hand. Only training and generation run on Kaggle.
+IS_KAGGLE: bool = _detect_kaggle()
 
 #: One seed for everything that can be seeded: fold assignment, evaluation
 #: sampling, exemplar choice, weight init, generation. Fixing it in one place

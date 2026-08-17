@@ -266,3 +266,22 @@ def test_the_kaggle_cell_reclones_rather_than_skipping():
         "re-cloned files will be shadowed by already-imported modules")
     assert cell.index("del sys.modules") < cell.index("import config"), (
         "stale modules are purged after config is imported, which is too late")
+
+
+def test_kaggle_detection_needs_more_than_a_bare_kaggle_directory():
+    """A bare /kaggle can exist off-Kaggle — on Colab it does. Treating that as
+    a Kaggle session sent DATA_DIR to /kaggle/input and RESULTS_DIR to
+    /kaggle/working on a machine where neither exists: the corpus read as empty
+    and the sweep reported zero recorded runs, while the files sat in the
+    checkout. Both mount points must be present."""
+    import inspect
+
+    source = inspect.getsource(config._detect_kaggle)
+    assert '"/kaggle/working"' in source and '"/kaggle/input"' in source
+    assert 'Path("/kaggle").is_dir()' not in source
+
+
+def test_this_machine_is_not_detected_as_kaggle():
+    assert config.IS_KAGGLE is False
+    assert config.DATA_DIR == config.PROJECT_ROOT / "data"
+    assert config.RESULTS_DIR == config.PROJECT_ROOT / "results"
