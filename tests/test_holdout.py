@@ -341,15 +341,15 @@ def test_cv_specs_cover_every_config_on_every_fold():
     assert len({s["run"] for s in specs}) == len(specs)
 
 
-def test_the_final_run_has_no_fold_suffix():
-    """There is exactly one, which is what the README's load snippet promises
+def test_the_final_runs_have_no_fold_suffix():
+    """One adapter per arm, which is what the README's load snippet promises
     and what the fold design could not provide."""
     from src.train import sweep
 
-    spec = sweep.final_spec({"rank": 8, "learning_rate": 1e-4})
-    assert spec["run"] == "lora_r8"
-    assert "fold" not in spec["run"]
-    assert config.run_adapter_dir(spec["run"]).name.endswith("lora_r8")
+    for spec in sweep.final_specs({"rank": 8, "learning_rate": 1e-4}):
+        assert spec["run"] == f"lora_r{spec['rank']}"
+        assert "fold" not in spec["run"]
+        assert config.run_adapter_dir(spec["run"]).name.endswith(spec["run"])
 
 
 def test_the_final_run_refuses_a_pool_overlapping_test():

@@ -1,10 +1,16 @@
-"""Tests for fold routing — the assertion that catches an excellent-looking result.
+"""Tests for arm routing — the assertion that catches an excellent-looking result.
 
-If `lora_r8` generates a poem using an adapter that trained on it, every
-grounding number rises and nothing errors. The outputs look fine, the run
-completes, the figures are plausible. This is the only place that failure is
-detectable, which is why the check re-derives the mapping independently rather
-than trusting what generation recorded.
+If a LoRA arm generates for a poem it trained on, every grounding number rises
+and nothing errors. The outputs look fine, the run completes, the figures are
+plausible. This is the only place that failure is detectable, which is why the
+check re-derives the expected adapter independently rather than trusting what
+generation recorded.
+
+Under 5-fold the risk was a per-poem lookup: `lora_r8` had five adapters and
+each could legitimately generate only for the poems its own fold held out. The
+holdout design removes the lookup — one adapter per arm, and the test poems were
+held out by every model — so the surviving risk is a poem from the POOL reaching
+generation. These tests pin both halves.
 """
 
 from __future__ import annotations
@@ -13,102 +19,113 @@ import config
 from src.generate import inference
 
 
-FOLD_OF = {1: 0, 2: 0, 3: 1, 4: 2, 5: 3, 6: 4}
+TEST_IDS = {1, 2, 3, 4, 5, 6}
+POOL_ID = 99
 
 
-def output(poem_id, arm, adapter=..., fold=...):
+def output(poem_id, arm, adapter=...):
     if adapter is ...:
-        adapter = inference.adapter_for(poem_id, arm, FOLD_OF)
+        adapter = inference.adapter_for(arm)
         adapter = str(adapter) if adapter else None
     return {"poem_id": poem_id, "arm": arm, "adapter": adapter,
-            "fold_id": FOLD_OF[poem_id] if fold is ... else fold,
             "interpretation": "text"}
 
 
 # --- routing ------------------------------------------------------------------
 
-def test_each_poem_routes_to_its_own_folds_adapter():
+def test_each_arm_routes_to_its_own_adapter():
     """Ends-with rather than equals: SMOKE prefixes the directory so a
     five-step gpt2 adapter cannot occupy a real adapter's path. The convention
-    that matters — rank and fold in the name — is what is pinned here."""
-    for poem_id, fold in FOLD_OF.items():
-        path = inference.adapter_for(poem_id, "lora_r8", FOLD_OF)
-        assert path.name.endswith(f"lora_r8_fold{fold}")
+    that matters — the rank in the name — is what is pinned here."""
+    for rank in config.LORA_ARM_RANKS:
+        assert inference.adapter_for(f"lora_r{rank}").name.endswith(
+            f"lora_r{rank}")
+
+
+def test_routing_needs_no_fold_lookup():
+    """The lookup WAS the hazard. It is gone, and a signature that still took a
+    poem id would invite it back."""
+    import inspect
+
+    assert list(inspect.signature(inference.adapter_for).parameters) == ["arm"]
 
 
 def test_untrained_arms_have_no_adapter():
-    for arm in ("template", "base_zero", "base_few"):
-        assert inference.adapter_for(1, arm, FOLD_OF) is None
+    for arm in inference.UNTRAINED_ARMS:
+        assert inference.adapter_for(arm) is None
 
 
-def test_a_poem_with_no_fold_cannot_be_routed():
+def test_the_two_lora_arms_have_distinct_adapters():
+    """Sharing a path would silently overwrite one with the other, and the
+    r8-vs-r16 contrast would compare a model against itself."""
+    paths = {inference.adapter_for(f"lora_r{r}")
+             for r in config.LORA_ARM_RANKS}
+    assert len(paths) == len(config.LORA_ARM_RANKS)
+
+
+def test_an_unknown_arm_raises():
+    """Rather than returning None, which would silently generate the arm from
+    the base model and label the output as fine-tuned."""
     try:
-        inference.adapter_for(999, "lora_r8", FOLD_OF)
-    except AssertionError:
+        inference.adapter_for("lora_r32")
+    except ValueError as error:
+        assert "unknown arm" in str(error)
         return
-    raise AssertionError("a poem outside the fold assignment was routed anyway")
-
-
-def test_lora_r16_refuses_poems_it_trained_on():
-    """It is trained on one fold's partition, so every OTHER fold's poems were
-    in its training data. Generating for them evaluates on training data."""
-    other = next(p for p, f in FOLD_OF.items() if f != config.SINGLE_SPLIT_FOLD)
-    try:
-        inference.adapter_for(other, "lora_r16", FOLD_OF)
-    except AssertionError as error:
-        assert "TRAINING data" in str(error)
-        return
-    raise AssertionError("lora_r16 was routed a poem it trained on")
-
-
-def test_lora_r16_accepts_its_own_folds_poems():
-    own = next(p for p, f in FOLD_OF.items() if f == config.SINGLE_SPLIT_FOLD)
-    assert inference.adapter_for(own, "lora_r16", FOLD_OF) is not None
+    raise AssertionError("an arm with no adapter was routed anyway")
 
 
 # --- the audit ----------------------------------------------------------------
 
 def test_correct_routing_passes():
-    inference.assert_fold_routing(
-        [output(p, "lora_r8") for p in FOLD_OF] +
-        [output(1, "base_few", adapter=None)], FOLD_OF)
+    inference.assert_routing(
+        [output(p, "lora_r8") for p in TEST_IDS] +
+        [output(1, "base_few", adapter=None)], TEST_IDS)
 
 
-def test_wrong_adapter_is_caught():
-    """The failure this module exists to prevent: poem 3 is held out by fold 1,
-    so fold 0's adapter TRAINED on it."""
-    bad = output(3, "lora_r8", adapter=str(config.ADAPTERS_DIR / "lora_r8_fold0"))
+def test_a_poem_outside_the_test_partition_is_caught():
+    """THE failure, under this design. Every LoRA arm trained on the pool, so an
+    output for a pool poem was produced by a model that had already read it."""
+    outputs = [output(p, "lora_r8") for p in TEST_IDS]
+    outputs.append(output(POOL_ID, "lora_r8"))
     try:
-        inference.assert_fold_routing([bad], FOLD_OF)
+        inference.assert_routing(outputs, TEST_IDS)
     except AssertionError as error:
-        assert "TRAINING data" in str(error)
+        assert "outside the test partition" in str(error)
         return
-    raise AssertionError("a poem generated by a model that trained on it passed")
+    raise AssertionError("a poem the model trained on passed the audit")
 
 
-def test_one_adapter_for_everything_is_caught():
-    """The specific mistake: load one adapter, generate all 150."""
-    single = str(config.ADAPTERS_DIR / "lora_r8_fold0")
-    outputs = [output(p, "lora_r8", adapter=single) for p in FOLD_OF]
+def test_generation_refuses_a_pool_poem_before_spending_a_gpu_hour():
+    """Checked up front, not after the fact: the cost of finding out afterwards
+    is a whole session, and good scores do not look like a failure."""
+    poems = [{"poem_id": POOL_ID, "title": "T", "author": "A",
+              "lines": ["a"], "interpretation": "x"}]
     try:
-        inference.assert_fold_routing(outputs, FOLD_OF)
-    except AssertionError:
+        inference.generate_arm(poems, "lora_r8", lambda _: None,
+                               test_ids=TEST_IDS)
+    except AssertionError as error:
+        assert "not in the test partition" in str(error)
         return
-    raise AssertionError("a single-adapter run passed the routing audit")
+    raise AssertionError("generation started on a poem the model trained on")
 
 
-def test_recorded_fold_must_match_the_assignment():
+def test_an_arm_generated_by_the_wrong_adapter_is_caught():
+    """Not a leak under this design — every adapter held out every test poem —
+    but it relabels one arm as another, which is enough to make lora_r8 vs
+    lora_r16 a comparison of a model against itself."""
+    bad = output(1, "lora_r8", adapter=str(inference.adapter_for("lora_r16")))
     try:
-        inference.assert_fold_routing([output(3, "lora_r8", fold=0)], FOLD_OF)
-    except AssertionError:
+        inference.assert_routing([bad], TEST_IDS)
+    except AssertionError as error:
+        assert "records adapter" in str(error)
         return
-    raise AssertionError("a mislabelled fold_id passed")
+    raise AssertionError("an arm generated by another arm's adapter passed")
 
 
 def test_untrained_arm_carrying_an_adapter_is_caught():
     bad = output(1, "base_zero", adapter="some/adapter")
     try:
-        inference.assert_fold_routing([bad], FOLD_OF)
+        inference.assert_routing([bad], TEST_IDS)
     except AssertionError:
         return
     raise AssertionError("an untrained arm with an adapter passed")
@@ -149,27 +166,29 @@ def test_base_few_without_exemplars_raises():
 def test_training_and_generation_agree_on_the_adapter_path():
     """The convention was written in three places and two spellings, agreeing
     only while LORA_RANK == 8. A mismatch does not fail cleanly for every poem
-    — it loses one arm or one fold, which reads as a partial run."""
-    from src.generate import inference
+    — it loses one arm, which reads as a partial run rather than a naming bug.
 
-    for fold in range(config.N_FOLDS):
-        assert (inference.adapter_for(1, "lora_r8", {1: fold})
-                == config.adapter_dir(8, fold))
+    Three spellings have to meet: what `final_specs` names the run, where
+    `run_adapter_dir` writes it, and where `adapter_for` looks for it."""
+    from src.train import sweep
 
-    single = config.SINGLE_SPLIT_FOLD
-    assert (inference.adapter_for(1, "lora_r16", {1: single})
-            == config.adapter_dir(16, single))
-
-
-def test_adapter_paths_are_distinct_per_rank_and_fold():
-    """Two runs sharing a path would silently overwrite each other, and the
-    second would generate for poems the first held out."""
-    paths = {config.adapter_dir(rank, fold)
-             for rank in (8, 16) for fold in range(config.N_FOLDS)}
-    assert len(paths) == 2 * config.N_FOLDS
+    for spec in sweep.final_specs({"learning_rate": 2e-4}):
+        assert (config.run_adapter_dir(spec["run"])
+                == config.adapter_dir(spec["rank"])
+                == inference.adapter_for(spec["run"]))
 
 
-def test_train_saves_the_adapter_when_given_a_fold():
+def test_the_arms_and_their_ranks_cannot_drift_apart():
+    """config.ARMS names what is generated and LORA_ARM_RANKS names what is
+    trained. If they disagree, one arm generates from the base model with
+    nothing raising."""
+    for rank in config.LORA_ARM_RANKS:
+        assert f"lora_r{rank}" in config.ARMS
+    assert len(config.ARMS) == len(inference.UNTRAINED_ARMS) + \
+        len(config.LORA_ARM_RANKS)
+
+
+def test_train_saves_the_adapter_in_the_same_call():
     """Kaggle sessions die. An adapter saved by a LATER notebook cell is one a
     dead kernel loses, costing the run rather than the cell."""
     import inspect
@@ -178,7 +197,7 @@ def test_train_saves_the_adapter_when_given_a_fold():
 
     source = inspect.getsource(loop.train)
     assert "save_adapter" in source
-    assert "config.adapter_dir" in source
+    assert "run_adapter_dir" in source
 
 
 # --- generation must never truncate a prompt ----------------------------------
@@ -201,20 +220,18 @@ def test_no_evaluation_prompt_is_truncated():
     base_few vs lora_r8 — the headline contrast — would have measured
     truncation.
     """
-    import json
-
     from src.data import filter as F
     from src.data import splits
     from src.generate import inference
 
     pairs = splits.load_training_pairs()
-    if not pairs or not config.FOLD_ASSIGNMENT_PATH.exists():
+    if not pairs or not config.HOLDOUT_PATH.exists():
         return
 
-    blob = json.loads(config.FOLD_ASSIGNMENT_PATH.read_text())
+    holdout = splits.load_holdout()
     by_id = {p["poem_id"]: p for p in pairs}
-    exemplars = [by_id[i] for i in blob["exemplar_poem_ids"] if i in by_id]
-    evaluation = [by_id[int(i)] for i in blob["eval_poem_ids"] if int(i) in by_id]
+    exemplars = [by_id[i] for i in holdout["exemplars"] if i in by_id]
+    evaluation = [by_id[i] for i in holdout["test"] if i in by_id]
     tokenizer = F.get_tokenizer()
 
     budget = config.GEN_MAX_CONTEXT - config.GEN_MAX_NEW_TOKENS

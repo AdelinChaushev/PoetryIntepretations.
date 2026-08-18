@@ -186,17 +186,19 @@ def test_a_diverging_rate_is_rejected():
     raise AssertionError("a diverging learning rate was accepted")
 
 
-def test_run_one_can_actually_be_called():
-    """The dangling reference this replaces: run_one called
-    setup.assert_matched_learning_rate, which did not exist. Tests exercised
-    plan() and final_specs() but never run_one's body, so the sweep failed on
-    its first real run instead of in CI."""
+def test_every_runner_can_actually_be_called():
+    """The dangling reference this replaces: the runner called
+    setup.assert_matched_learning_rate, which did not exist. Tests exercised the
+    spec lists but never a runner's body, so the sweep failed on its first real
+    run instead of in CI — a Kaggle session to discover a typo."""
     import inspect
 
     from src.model import setup
     from src.train import sweep
 
-    source = inspect.getsource(sweep.run_one)
-    for name in {line.split("setup.")[1].split("(")[0]
-                 for line in source.splitlines() if "setup." in line}:
-        assert hasattr(setup, name), f"sweep.run_one calls missing setup.{name}"
+    for runner in (sweep.run_cv_fold, sweep.run_final, sweep.run_ablation):
+        source = inspect.getsource(runner)
+        for name in {line.split("setup.")[1].split("(")[0]
+                     for line in source.splitlines() if "setup." in line}:
+            assert hasattr(setup, name), \
+                f"sweep.{runner.__name__} calls missing setup.{name}"

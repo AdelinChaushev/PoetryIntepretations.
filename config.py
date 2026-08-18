@@ -189,25 +189,27 @@ def run_adapter_dir(run_name: str) -> Path:
     return ADAPTERS_DIR / f"{'smoke_' if SMOKE else ''}{run_name}"
 
 
-def adapter_dir(rank: int, fold: int) -> Path:
+def adapter_dir(rank: int) -> Path:
     """Canonical location of one FINAL adapter — the ones generation loads.
 
     **One definition, because two would drift silently.** Training writes the
     adapter and `generate.inference.adapter_for` reads it back, and if those
     spellings ever disagree the failure is not a clean "file not found" for
-    every poem — it is a missing adapter for *one* arm or *one* fold, which
-    looks like a partial run rather than a naming bug.
+    every poem — it is a missing adapter for *one* arm, which looks like a
+    partial run rather than a naming bug.
 
-    The rank is in the name because `lora_r8` and `lora_r16` are separate arms
-    trained from the same code path; the fold is in the name because `lora_r8`
-    has five adapters and each may only generate for the poems its own fold
-    held out.
+    The rank is in the name because ``lora_r8`` and ``lora_r16`` are separate
+    arms trained from the same code path. There is **no fold in the name**: the
+    holdout design trains one adapter per arm on the whole pool, so the name of
+    the arm and the name of the run are the same string, and routing needs no
+    lookup at all. Under 5-fold this took a ``fold`` argument and the lookup was
+    the single easiest way to invalidate the project.
 
     Smoke runs get their own prefix, so a five-step gpt2 adapter never occupies
     the path a real one is loaded from. Both training and generation resolve
     through here, so the two stay consistent in either mode.
     """
-    return run_adapter_dir(f"lora_r{rank}_fold{fold}")
+    return run_adapter_dir(f"lora_r{rank}")
 FIGURES_DIR: Path = RESULTS_DIR / "figures"
 
 
@@ -823,19 +825,6 @@ LR_SWEEP: tuple[float, ...] = (1e-4, 2e-4)
 DATA_SIZE_SWEEP: tuple[int | None, ...] = (200, 500, 1000, None)
 MASKING_SWEEP: tuple[str, ...] = ("masked", "unmasked")
 
-#: Adapter ranks used by the final evaluated arms.
-ARM_RANKS: dict[str, int] = {"lora_r8": 8, "lora_r16": 16}
-
-#: The fold whose partition every single-split run uses — the sweep, and
-#: lora_r16. Fixed so the rank comparison stays like-for-like: fold-N r8 against
-#: fold-N r16, never fold-averaged r8 against a single-split r16.
-#:
-#: The consequence is that lora_r16 can only legitimately generate for the ~30
-#: evaluation poems this fold held out. Its confidence interval is therefore
-#: visibly wider than every other arm's, and that is a property of the design
-#: rather than noise.
-SINGLE_SPLIT_FOLD: int = 0
-
 #: How the sweep picks a winner. Fixed HERE, before any sweep run, because
 #: choosing the criterion after seeing results is the researcher freedom the
 #: pre-registration exists to remove — and with 13 runs there is always a metric
@@ -859,6 +848,29 @@ SWEEP_SELECTION_LOWER_IS_BETTER: bool = True
 # ---------------------------------------------------------------------------
 
 ARMS: tuple[str, ...] = ("template", "base_zero", "base_few", "lora_r8", "lora_r16")
+
+#: The ranks the two LoRA arms are trained at. **Pre-registered, and NOT taken
+#: from whatever the sweep chose.** They name the arms; letting a winning rank
+#: of 4 rename them would change the experiment after seeing results, which is
+#: the researcher freedom the pre-registration exists to remove. The sweep
+#: supplies the learning rate, and the rank question is answered by the CV curve
+#: over {4, 8, 16} rather than by renaming an arm.
+#:
+#: Both are trained on the SAME pool under the holdout design, so lora_r8 vs
+#: lora_r16 differs in rank and nothing else. Under 5-fold it compared fold-0 r8
+#: against fold-0 r16 and the difference also carried which poems each had seen.
+LORA_ARM_RANKS: tuple[int, ...] = (8, 16)
+
+#: The headline LoRA arm — the one H1-H3 are stated about and the one the
+#: data-size and masking ablations are drawn at, so the ablations' full-corpus
+#: point IS this arm's own row rather than a sixth run nobody reports.
+PRIMARY_LORA_RANK: int = 8
+
+assert tuple(f"lora_r{r}" for r in LORA_ARM_RANKS) == ARMS[-len(LORA_ARM_RANKS):], (
+    "ARMS and LORA_ARM_RANKS disagree; generation routes on the arm name and "
+    "training writes the adapter from the rank, so a mismatch means one arm "
+    "generates from the base model with nothing raising")
+assert PRIMARY_LORA_RANK in LORA_ARM_RANKS
 
 GEN_TEMPERATURE: float = 0.7
 GEN_TOP_P: float = 0.9
@@ -1079,6 +1091,25 @@ CONTAMINATION_PATH: Path = _result("contamination.jsonl")
 BOOTSTRAP_ITERATIONS: int = 100 if SMOKE else 10_000
 CONFIDENCE_LEVEL: float = 0.95
 ALPHA: float = 0.05
+
+#: Confidence level for every interval. Stated once so a figure and a table can
+#: never disagree about what their error bars mean.
+CI_LEVEL: float = 0.95
+
+#: Bootstrap resamples. 10,000 is the usual floor for a stable percentile
+#: interval at the 95% level — below it the endpoints wobble between runs, which
+#: would make a reported CI depend on the seed.
+BOOTSTRAP_RESAMPLES: int = 10_000
+
+#: Whether to correct the four pre-registered p-values for multiple comparisons.
+#:
+#: OFF, deliberately. H1-H4 are not a family being screened for any significant
+#: result; each is a separate pre-registered prediction with its own direction,
+#: and two of them (H2, H3) predict nulls — where correction makes a null easier
+#: to obtain and so favours the prediction. Holm-corrected values are reported
+#: alongside as a robustness check, never substituted.
+CORRECT_MULTIPLE_COMPARISONS: bool = False
+MULTIPLE_COMPARISON_METHOD: str = "holm"
 
 
 # ---------------------------------------------------------------------------

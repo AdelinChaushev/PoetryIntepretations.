@@ -422,10 +422,39 @@ def test_masking_defaults_to_masked():
                                    ).completion_only_loss is True
 
 
-def test_run_one_forwards_the_masking_axis():
+def test_every_runner_forwards_the_masking_axis():
+    """Every path into loop.train must pass it through, or the unmasked
+    ablation trains masked and the reported comparison is between two identical
+    configurations."""
     import inspect
 
     from src.train import sweep
 
-    assert 'masking=spec.get("masking", "masked")' in inspect.getsource(
-        sweep.run_one)
+    for runner in (sweep.run_cv_fold, sweep.run_final, sweep.run_ablation):
+        assert 'masking=spec.get("masking", "masked")' in inspect.getsource(
+            runner), runner.__name__
+
+
+def test_the_masking_ablation_is_the_only_unmasked_run():
+    """One unmasked point, and it must be at the winner so the comparison is
+    against the model actually being reported."""
+    from src.train import sweep
+
+    winner = {"rank": 8, "learning_rate": 2e-4}
+    unmasked = [s for s in sweep.ablation_specs(winner)
+                if s.get("masking") == "unmasked"]
+    assert len(unmasked) == 1
+    assert unmasked[0]["rank"] == 8 and unmasked[0]["learning_rate"] == 2e-4
+    assert unmasked[0].get("data_size") is None, \
+        "the masking run must use the full pool, or it varies two things"
+
+
+def test_the_masking_setting_is_recorded_as_a_column():
+    """A two-row comparison whose distinguishing variable is only recoverable
+    by parsing run names is a comparison waiting to be mis-tabulated."""
+    import inspect
+
+    from src.train import loop
+
+    assert '"masking": overrides.get("masking", "masked")' in \
+        inspect.getsource(loop.train)

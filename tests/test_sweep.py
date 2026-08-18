@@ -29,20 +29,45 @@ def test_tuning_is_one_at_a_time_not_a_product():
     assert len({(s["rank"], s["learning_rate"]) for s in grid}) == len(grid)
 
 
-def test_curves_run_at_the_winner_not_the_defaults():
-    """A curve drawn at a rejected configuration describes a model nobody will
-    train."""
-    winner = {"rank": 16, "learning_rate": 5e-4}
-    for spec in sweep.reported_curves(winner):
-        assert spec["rank"] == 16 and spec["learning_rate"] == 5e-4
+def test_ablations_run_at_the_tuned_rate_and_the_primary_arm():
+    """The rate comes from the sweep — a curve drawn at a rejected rate
+    describes a model nobody will train. The RANK does not: the curve's
+    right-hand end has to be a run that already exists, and that is lora_r8. A
+    winning rank of 4 would leave the n=full point belonging to no arm."""
+    for spec in sweep.ablation_specs({"rank": 4, "learning_rate": 5e-4}):
+        assert spec["learning_rate"] == 5e-4
+        assert spec["rank"] == config.PRIMARY_LORA_RANK
 
 
-def test_curves_do_not_repeat_the_winners_own_point():
-    curves = sweep.reported_curves({"rank": 8, "learning_rate": 2e-4})
+def test_ablations_do_not_repeat_the_final_models_own_point():
+    """n=full at masked IS the final model. Running it again would spend an hour
+    to produce a second copy of a row that already exists, and the data-size
+    curve's right-hand end is that row."""
+    curves = sweep.ablation_specs({"rank": 8, "learning_rate": 2e-4})
     assert all(s.get("data_size") is not None or s.get("masking") != "masked"
                for s in curves)
     assert not any(s.get("data_size") is None and s.get("masking") == "masked"
                    for s in curves)
+
+
+def test_ablation_names_cannot_collide_with_the_final_model():
+    """Adapters are keyed on the run name. An ablation named lora_r8 would
+    overwrite the adapter every reported number is generated from."""
+    winner = {"rank": 8, "learning_rate": 2e-4}
+    names = [s["run"] for s in sweep.ablation_specs(winner)]
+    final = {s["run"] for s in sweep.final_specs(winner)}
+    assert len(set(names)) == len(names)
+    assert not (set(names) & final)
+    assert all(n.startswith("ablation_") for n in names)
+
+
+def test_the_data_size_sweep_straddles_limas_threshold():
+    """LIMA reported 1,000 curated examples sufficing. The comparison the
+    project claims is where OUR curve flattens relative to theirs, which needs
+    points on both sides of 1,000 — not merely that we also used few examples."""
+    sizes = [s["data_size"] for s in sweep.ablation_specs(
+        {"rank": 8, "learning_rate": 2e-4}) if s.get("data_size")]
+    assert any(n < 1000 for n in sizes) and 1000 in sizes
 
 
 def test_every_run_early_stops_via_the_global_default():
@@ -50,7 +75,7 @@ def test_every_run_early_stops_via_the_global_default():
     would otherwise train to its step floor regardless of its validation curve,
     and the data-size curve would measure overfitting rather than data."""
     assert config.EARLY_STOPPING
-    curves = sweep.reported_curves({"rank": 8, "learning_rate": 2e-4})
+    curves = sweep.ablation_specs({"rank": 8, "learning_rate": 2e-4})
     assert curves and not any("early_stopping" in s for s in curves)
 
 
@@ -107,8 +132,11 @@ def test_run_names_encode_what_varied():
 
 def test_plan_reports_the_full_size_before_any_gpu_time():
     plan = sweep.plan()
-    assert plan["total"] == plan["tuning_runs"] + plan["curve_runs"]
-    assert plan["tuning_runs"] == len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
+    assert plan["total"] == (plan["tuning_runs"] + plan["final_runs"]
+                             + plan["ablation_runs"])
+    configs = len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
+    assert plan["tuning_runs"] == configs * config.TUNING_FOLDS
+    assert plan["final_runs"] == len(config.LORA_ARM_RANKS)
 
 
 def test_specs_do_not_override_the_global_early_stopping_default():
@@ -118,13 +146,14 @@ def test_specs_do_not_override_the_global_early_stopping_default():
     import inspect
     from src.train import sweep as module
 
-    source = inspect.getsource(module.run_one)
-    assert 'spec.get("early_stopping")' in source
-    assert 'spec.get("early_stopping", False)' not in source
+    for runner in (module.run_cv_fold, module.run_final, module.run_ablation):
+        source = inspect.getsource(runner)
+        assert 'spec.get("early_stopping")' in source
+        assert 'spec.get("early_stopping", False)' not in source
 
 
 def test_curve_specs_leave_early_stopping_to_config():
-    for spec in sweep.reported_curves({"rank": 8, "learning_rate": 2e-4}):
+    for spec in sweep.ablation_specs({"rank": 8, "learning_rate": 2e-4}):
         assert "early_stopping" not in spec
 
 
@@ -212,37 +241,38 @@ def test_the_gpu_only_modules_are_smoke_runnable():
 
 # --- the driver ---------------------------------------------------------------
 
-def test_final_specs_are_the_six_reported_runs():
-    from src.train import sweep
-
+def test_there_is_exactly_one_adapter_per_arm():
+    """The whole point of replacing 5-fold with a holdout. Five adapters trained
+    on different data cannot be merged, so the README's load snippet could not
+    name one — and an arm the results report has to be a single artefact."""
     specs = sweep.final_specs({"rank": 4, "learning_rate": 5e-4})
-    assert len(specs) == config.N_FOLDS + 1
-    assert sorted(s["fold"] for s in specs if s["rank"] == 8) == \
-        list(range(config.N_FOLDS))
-    r16 = [s for s in specs if s["rank"] == 16]
-    assert len(r16) == 1 and r16[0]["fold"] == config.SINGLE_SPLIT_FOLD
+    assert [s["run"] for s in specs] == ["lora_r8", "lora_r16"]
+    assert not any("fold" in s for s in specs)
 
 
-def test_final_ranks_ignore_the_winning_rank():
-    """The arms are named lora_r8 and lora_r16 in the pre-registration. Letting
-    a winning rank of 4 rename them would change the experiment after seeing
-    results — the rank question is answered by the reported curve instead."""
-    from src.train import sweep
-
+def test_the_arm_ranks_ignore_the_winning_rank():
+    """They name the pre-registered arms. Letting a winning rank of 4 rename
+    them would change the experiment after seeing results — the rank question is
+    answered by the CV curve over {4, 8, 16}, not by renaming an arm."""
     specs = sweep.final_specs({"rank": 4, "learning_rate": 1e-4})
-    assert {s["rank"] for s in specs} == {8, 16}
+    assert [s["rank"] for s in specs] == list(config.LORA_ARM_RANKS)
+    assert all(isinstance(s["rank"], int) for s in specs)
     # The learning rate IS taken from the winner.
     assert {s["learning_rate"] for s in specs} == {1e-4}
 
 
-def test_r16_shares_a_fold_with_an_r8_run():
-    """Otherwise lora_r8 vs lora_r16 compares a fold-averaged r8 against a
-    single-split r16, and the difference includes which poems each saw."""
-    from src.train import sweep
+def test_both_arms_see_the_same_data():
+    """lora_r8 vs lora_r16 must isolate adapter capacity. Under 5-fold it
+    compared fold-0 r8 against fold-0 r16 and the difference also carried which
+    poems each had seen; both now train on the whole pool."""
+    import inspect
 
     specs = sweep.final_specs({"learning_rate": 2e-4})
-    r16 = next(s for s in specs if s["rank"] == 16)
-    assert any(s["rank"] == 8 and s["fold"] == r16["fold"] for s in specs)
+    assert len({s["learning_rate"] for s in specs}) == 1
+    # run_final takes the pool unconditionally — no per-spec data selection.
+    source = inspect.getsource(sweep.run_final)
+    assert "pool_partition(pairs)" in source
+    assert "data_size" not in source
 
 
 def test_completed_runs_are_skipped(tmp_path, monkeypatch):
@@ -277,7 +307,8 @@ def test_every_run_keeps_its_weights():
 
     from src.train import sweep
 
-    assert "save_adapters: bool = True" in inspect.getsource(sweep.run_stage)
+    for runner in (sweep.run_cv_fold, sweep.run_final, sweep.run_ablation):
+        assert "save_adapter: bool = True" in inspect.getsource(runner)
 
 
 def test_adapter_paths_never_collide_across_the_programme():
@@ -287,29 +318,25 @@ def test_adapter_paths_never_collide_across_the_programme():
     — which encodes everything that varied — fixes it."""
     from src.train import sweep
 
-    names = ([sweep.run_name(s) for s in sweep.lr_specs()]
-             + [sweep.run_name(s) for s in sweep.rank_specs(5e-4)]
-             + [sweep.run_name(s) for s in sweep.reported_curves(
-                 {"rank": 16, "learning_rate": 5e-4})]
-             + [s["run"] for s in sweep.final_specs({"learning_rate": 5e-4})])
+    winner = {"rank": 16, "learning_rate": 5e-4}
+    names = ([s["run"] for s in sweep.cv_specs()]
+             + [s["run"] for s in sweep.ablation_specs(winner)]
+             + [s["run"] for s in sweep.final_specs(winner)])
     paths = [config.run_adapter_dir(n) for n in names]
     assert len(set(paths)) == len(set(names)), "two runs share an adapter path"
 
 
-def test_final_adapter_paths_are_what_generation_looks_for():
-    """run_adapter_dir and adapter_dir must agree for the final runs, or
-    training writes weights generation never finds — a missing adapter for one
-    fold, which reads as a partial run rather than a naming bug."""
-    from src.generate import inference
+def test_the_final_adapter_lands_where_its_run_name_says():
+    """One model, one adapter directory, named after the run — which is what
+    the README's load snippet points at."""
     from src.train import sweep
 
-    for spec in sweep.final_specs({"learning_rate": 2e-4}):
-        assert (config.run_adapter_dir(spec["run"])
-                == config.adapter_dir(spec["rank"], spec["fold"]))
-
-    for fold in range(config.N_FOLDS):
-        assert (inference.adapter_for(1, "lora_r8", {1: fold})
-                == config.run_adapter_dir(f"lora_r8_fold{fold}"))
+    for spec in sweep.final_specs({"rank": 8, "learning_rate": 2e-4}):
+        path = config.run_adapter_dir(spec["run"])
+        # `smoke_` under SMOKE, and deliberately so — a five-step gpt2 adapter
+        # must not land on the path the README tells a reader to load.
+        assert path.name.endswith(f"lora_r{spec['rank']}")
+        assert config.SMOKE == path.name.startswith("smoke_")
 
 
 def test_csv_numbers_are_coerced_before_selection():
@@ -334,11 +361,16 @@ def test_the_full_programme_fits_a_gpu_week():
     from src.train import sweep
 
     plan = sweep.plan()
-    total = plan["total"] + len(sweep.final_specs({}))
-    expected = (len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
-                + plan["curve_runs"] + config.N_FOLDS + 1)
-    assert total == expected, f"programme is {total}, expected {expected}"
-    assert total * 1.6 < 30, f"{total} runs is more than a GPU week"
+    configs = len(config.RANK_SWEEP) + len(config.LR_SWEEP) - 1
+    expected = (configs * config.TUNING_FOLDS + len(config.LORA_ARM_RANKS)
+                + plan["ablation_runs"])
+    assert plan["total"] == expected, f"programme is {plan['total']}"
+
+    # Tuning runs on a subsample of the pool and ablations on subsets, so the
+    # per-run hour is only paid in full by the final model. Costing everything
+    # at the full-corpus rate is therefore an upper bound, which is the side to
+    # be wrong on when the question is whether the week is enough.
+    assert plan["total"] * 1.6 < 30, f"{plan['total']} runs is over a GPU week"
 
 
 def test_a_name_match_at_the_wrong_config_is_not_done():
@@ -389,8 +421,6 @@ def test_a_row_missing_a_required_column_is_re_run():
     spec = {"run": "lora_r8_fold0", "rank": 8, "learning_rate": 2e-4, "fold": 0}
 
     assert sweep.already_done(spec, {"lora_r8_fold0": pilot}) is True
-    import inspect
-    assert "requires" in inspect.signature(sweep.run_stage).parameters
 
 
 def test_selection_refuses_to_read_the_held_out_fold():
@@ -462,7 +492,7 @@ def test_curve_specs_inherit_an_integer_rank():
                "learning_rate": "0.0002", "trainable_params": "8798208",
                "final_val_loss": "1.55"}]
     winner = sweep.select_winner(sweep.coerce(as_csv))
-    for spec in sweep.reported_curves(winner) + sweep.final_specs(winner):
+    for spec in sweep.ablation_specs(winner) + sweep.final_specs(winner):
         assert isinstance(spec["rank"], int), spec
 
 
@@ -500,11 +530,14 @@ def test_both_sweep_axes_are_still_covered():
 
 
 def test_batching_bounds_what_a_lost_session_costs():
+    """RESULTS_DIR does not survive a session on Kaggle or Colab. A stage that
+    runs for hours and is cut off loses every row it wrote."""
     import inspect
 
     from src.train import sweep
 
-    assert "max_runs" in inspect.signature(sweep.run_stage).parameters
+    for stage in (sweep.run_cv_stage, sweep.run_ablation_stage):
+        assert "max_runs" in inspect.signature(stage).parameters
 
 
 # --- tuning is sequential, not independent ------------------------------------
@@ -512,8 +545,8 @@ def test_batching_bounds_what_a_lost_session_costs():
 def test_the_rank_sweep_runs_at_the_chosen_learning_rate():
     """Greedy coordinate descent, not independent one-at-a-time. Sweeping rank
     around a fixed DEFAULT would draw the rank curve at a configuration the
-    search may already have rejected — the same objection that puts
-    reported_curves at the winner rather than at the defaults."""
+    search may already have rejected — the same objection that puts the
+    ablations at the winner rather than at the defaults."""
     from src.train import sweep
 
     chosen = next(lr for lr in config.LR_SWEEP if lr != config.LEARNING_RATE)
@@ -607,16 +640,157 @@ def test_the_batch_limit_does_not_inflate_the_recorded_count(caplog, tmp_path,
         writer = csv.DictWriter(handle, fieldnames=["run", "rank",
                                                     "learning_rate"])
         writer.writeheader()
-        for fold in range(3):                       # 3 of the 6 final runs
-            writer.writerow({"run": f"lora_r8_fold{fold}", "rank": 8,
+        winner = {"rank": 8, "learning_rate": 1e-4}
+        for spec in sweep.ablation_specs(winner)[:3]:   # 3 of the 4 ablations
+            writer.writerow({"run": spec["run"], "rank": 8,
                              "learning_rate": 1e-4})
     monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
-    monkeypatch.setattr(sweep, "run_one", lambda *a, **k: None)
+    monkeypatch.setattr(sweep, "run_ablation", lambda *a, **k: None)
 
     with caplog.at_level(logging.INFO):
-        sweep.run_stage(sweep.final_specs({"learning_rate": 1e-4}), [],
-                        stage="final", max_runs=1)
+        sweep.run_ablation_stage([], {"rank": 8, "learning_rate": 1e-4},
+                                 max_runs=1)
 
     line = next(m for m in caplog.messages if "already recorded" in m)
     assert "3 already recorded" in line, line
-    assert "3 still to run" in line, line
+    assert "1 still to run" in line, line
+
+
+# --- ablations ----------------------------------------------------------------
+#
+# The data-size curve is a comparison across runs, so what has to hold is that
+# only the size differs. Anything else that moves with it — which poems, which
+# split, which set it is scored on — turns the curve into a measurement of two
+# things at once.
+
+def ablation_pairs(n=40):
+    """A corpus with a test partition and a pool, shaped like the real one."""
+    return [{"poem_id": i, "author": f"a{i % 8}", "poem": "line\n" * 9,
+             "interpretation": "x"} for i in range(n)]
+
+
+def stub_splits(monkeypatch, pairs, test_ids):
+    """Route pool/test through explicit id sets, so the assertions in the
+    runner are exercised without holdout.json being present."""
+    from src.data import splits
+
+    test = [p for p in pairs if p["poem_id"] in test_ids]
+    pool = [p for p in pairs if p["poem_id"] not in test_ids]
+    monkeypatch.setattr(splits, "test_partition", lambda _: test)
+    monkeypatch.setattr(splits, "pool_partition", lambda _: pool)
+    monkeypatch.setattr(splits, "untouched_authors", lambda _: set())
+    return pool, test
+
+
+def capture_train(monkeypatch):
+    """Record what reaches loop.train instead of training anything."""
+    from src.model import setup
+    from src.train import dataset, loop
+
+    seen = {}
+
+    def fake_train(model, tokenizer, examples, pairs, **kwargs):
+        seen.update(kwargs, examples=examples)
+        return {"run": kwargs["run_name"]}
+
+    monkeypatch.setattr(loop, "train", fake_train)
+    monkeypatch.setattr(dataset, "build_dataset", lambda p, t: list(p))
+    monkeypatch.setattr(setup, "load_tokenizer", lambda: None)
+    monkeypatch.setattr(setup, "load_base_model", lambda: None)
+    monkeypatch.setattr(setup, "apply_lora", lambda m, rank: m)
+    monkeypatch.setattr(setup, "assert_matched_learning_rate",
+                        lambda *a, **k: None)
+    return seen
+
+
+def test_the_data_size_subset_is_deterministic(monkeypatch):
+    """Two runs at n=10 must train on the SAME ten poems. Subsetting whatever
+    order the corpus arrived in would make the curve depend on file order, and
+    a re-run at one point would silently not be comparable with the others."""
+    from src.train import sweep
+
+    pairs = ablation_pairs()
+    first, second = [], []
+    for out in (first, second):
+        stub_splits(monkeypatch, pairs, test_ids={0, 1, 2})
+        seen = capture_train(monkeypatch)
+        sweep.run_ablation({"rank": 8, "learning_rate": 2e-4, "data_size": 10,
+                            "run": "ablation_n10"}, pairs, save_adapter=False)
+        out.extend(p["poem_id"] for p in seen["examples"])
+
+    assert first == second == sorted(first)
+    assert len(first) == 10
+
+
+def test_the_data_size_subset_never_reaches_into_the_test_set(monkeypatch):
+    """The subset is taken from the pool, so a low-numbered test poem must not
+    be swept up by `sorted(...)[:n]`. It would train on data the same run is
+    then scored against, and the smallest data point — the one most likely to
+    look surprisingly good — is where it would happen."""
+    from src.train import sweep
+
+    pairs = ablation_pairs()
+    pool, test = stub_splits(monkeypatch, pairs, test_ids={0, 1, 2, 3, 4})
+    seen = capture_train(monkeypatch)
+    sweep.run_ablation({"rank": 8, "learning_rate": 2e-4, "data_size": 6,
+                        "run": "ablation_n6"}, pairs, save_adapter=False)
+
+    trained = {p["poem_id"] for p in seen["examples"]}
+    assert not trained & {p["poem_id"] for p in test}
+    assert trained == {5, 6, 7, 8, 9, 10}
+
+
+def test_every_ablation_is_scored_on_the_same_test_set(monkeypatch):
+    """The data-size curve's right-hand end is the final model's own row. If an
+    ablation were scored on anything else, the curve would join points measured
+    by different rulers."""
+    from src.train import sweep
+
+    pairs = ablation_pairs()
+    winner = {"rank": 8, "learning_rate": 2e-4}
+    for spec in sweep.ablation_specs(winner):
+        _, test = stub_splits(monkeypatch, pairs, test_ids={0, 1, 2})
+        seen = capture_train(monkeypatch)
+        sweep.run_ablation({**spec, "data_size": spec.get("data_size") and 5},
+                           pairs, save_adapter=False)
+        assert [p["poem_id"] for p in seen["heldout"]] == \
+            [p["poem_id"] for p in test], spec["run"]
+        assert seen.get("fold") is None, "an ablation is not a fold"
+
+
+def test_the_unmasked_ablation_trains_on_the_whole_pool(monkeypatch):
+    """It varies masking and nothing else, so it must see exactly what the
+    final model sees."""
+    from src.train import sweep
+
+    pairs = ablation_pairs()
+    pool, _ = stub_splits(monkeypatch, pairs, test_ids={0, 1, 2})
+    seen = capture_train(monkeypatch)
+    sweep.run_ablation({"rank": 8, "learning_rate": 2e-4,
+                        "masking": "unmasked", "run": "ablation_unmasked"},
+                       pairs, save_adapter=False)
+
+    assert len(seen["examples"]) == len(pool)
+    assert seen["masking"] == "unmasked"
+
+
+def test_an_ablation_refuses_to_train_on_the_test_set(monkeypatch):
+    """The guard that would have to fail silently for the whole result to be
+    wrong. If pool and test ever overlap, the run is scored by data it trained
+    on and every ablation number is optimistic."""
+    from src.data import splits
+    from src.train import sweep
+
+    pairs = ablation_pairs()
+    capture_train(monkeypatch)
+    monkeypatch.setattr(splits, "untouched_authors", lambda _: set())
+    monkeypatch.setattr(splits, "pool_partition", lambda _: pairs)
+    monkeypatch.setattr(splits, "test_partition", lambda _: pairs[:3])
+
+    try:
+        sweep.run_ablation({"rank": 8, "learning_rate": 2e-4, "data_size": 5,
+                            "run": "ablation_n5"}, pairs, save_adapter=False)
+    except AssertionError as error:
+        assert "test set" in str(error)
+        return
+    raise AssertionError("an ablation trained on the poems scoring it")

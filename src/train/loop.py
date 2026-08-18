@@ -342,21 +342,24 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
           prefer_unused: set | None = None, **overrides) -> dict:
     """Train one adapter. Returns the run record written to ``runs.csv``.
 
-    Pass ``fold`` to have the adapter written here, in the same call that
-    trained it. Kaggle sessions die, and an adapter saved by a *later* notebook
-    cell is one a dead kernel loses — costing the whole run, not just the cell.
-    The path comes from :func:`config.adapter_dir`, the same function
-    ``inference.adapter_for`` reads back, so the two cannot drift.
+    The adapter is written here, in the same call that trained it. Kaggle
+    sessions die, and an adapter saved by a *later* notebook cell is one a dead
+    kernel loses — costing the whole run, not just the cell.
+
+    The path comes from :func:`config.run_adapter_dir`, keyed on the RUN NAME.
+    ``(rank, fold)`` is not unique across a sweep — three learning rates at rank
+    8 all resolve to the same path, so the last would silently overwrite the
+    rest and the surviving adapter would belong to no recorded run in
+    particular. The run name encodes everything that varied.
+
+    For the two reported arms the run name IS the arm name, so
+    ``run_adapter_dir("lora_r8")`` is where ``inference.adapter_for("lora_r8")``
+    looks. The two cannot drift: both resolve through the same function.
 
     With ``load_best_model_at_end`` the object saved holds the **best** weights
     rather than the ones the run stopped on. Verified rather than assumed: the
     written adapter is byte-identical to the best checkpoint and differs from
     the last.
-
-    ``save_adapter=False`` for sweep runs. Nine grid points at three ranks would
-    otherwise collide — every rank-8 configuration writes to the same
-    ``adapter_dir(8, fold)``, so the last one silently overwrites the rest and
-    the surviving adapter belongs to no recorded run in particular.
 
     **Two perplexities are recorded, and the difference between them matters.**
     ``val_perplexity`` comes from the validation slice, which early stopping
@@ -439,6 +442,10 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         "alpha": config.lora_alpha(overrides.get("rank", config.LORA_RANK)),
         "target_modules": ",".join(config.LORA_TARGET_MODULES),
         "learning_rate": overrides.get("learning_rate", config.LEARNING_RATE),
+        # Recorded as a column, not left to be parsed back out of the run name.
+        # The masking ablation is a two-row comparison and both rows have to be
+        # findable by what varied.
+        "masking": overrides.get("masking", "masked"),
         "batch_size": config.BATCH_SIZE,
         "grad_accum": config.GRAD_ACCUM_STEPS,
         "effective_batch": effective,
@@ -485,9 +492,14 @@ def train(model, tokenizer, examples: list[dict], pairs: list[dict],
         record.update(heldout_loss=metrics["loss"],
                       heldout_perplexity=metrics["perplexity"],
                       n_heldout=metrics["n"])
-        log.info("fold %d held out: perplexity %.3f over %d examples "
+        # `fold` is None for the final model and the ablations, which are
+        # measured on the test partition rather than on a fold. %d would not
+        # format that, and logging swallows the error rather than raising it,
+        # so the line would vanish instead of failing loudly.
+        log.info("%s held out: perplexity %.3f over %d examples "
                  "(validation said %.3f, but selection chose on it)",
-                 fold, metrics["perplexity"], metrics["n"],
+                 "test set" if fold is None else f"fold {fold}",
+                 metrics["perplexity"], metrics["n"],
                  record["val_perplexity"])
 
     if save_adapter:
@@ -804,10 +816,13 @@ def _smoke() -> None:
         f"every pair exceeded MAX_SEQ_LEN={config.MAX_SEQ_LEN}; nothing to "
         f"train on")
 
-    # fold is passed so the ADAPTER SAVE is exercised too. Without it the smoke
-    # run verifies training and skips the step whose failure costs the run.
+    # `heldout` is passed explicitly, the way run_final and run_ablation pass
+    # the test partition — that is the path the reported runs take, so it is the
+    # one that needs smoke coverage. It also exercises the ADAPTER SAVE; without
+    # it the smoke run verifies training and skips the step whose failure costs
+    # the run.
     record = train(model, tokenizer, examples, pairs, run_name="smoke",
-                   max_steps=config.MAX_STEPS, fold=config.SINGLE_SPLIT_FOLD)
+                   max_steps=config.MAX_STEPS, heldout=examples[:2])
     print(f"\n  {record['steps_run']} steps on {record['n_train']} examples "
           f"in {record['wall_clock_seconds']}s")
     print(f"  val loss {record['final_val_loss']:.4f}  ->  perplexity "
@@ -828,9 +843,16 @@ def _smoke() -> None:
         AutoModelForCausalLM.from_pretrained(config.MODEL), str(saved))
     print(f"    reloads onto a fresh {config.MODEL}: True")
 
+    # The invariant that matters is the CONVENTION, not this run's own path:
+    # training writes an arm's adapter via config.run_adapter_dir and generation
+    # reads it via inference.adapter_for. If those two spellings ever disagree
+    # the symptom is one arm silently generating from the base model.
     from src.generate import inference
-    expected = inference.adapter_for(1, "lora_r8", {1: config.SINGLE_SPLIT_FOLD})
-    print(f"    generation looks for it here too: {saved == expected}")
+    for rank in config.LORA_ARM_RANKS:
+        arm = f"lora_r{rank}"
+        assert config.run_adapter_dir(arm) == inference.adapter_for(arm), arm
+    print(f"    training and generation agree on the path for "
+          f"{', '.join(f'lora_r{r}' for r in config.LORA_ARM_RANKS)}")
 
 
 if __name__ == "__main__":

@@ -60,9 +60,9 @@ def rank_specs(learning_rate: float) -> list[dict]:
 
     **Sequential, not independent.** Sweeping rank at a fixed *default* rate
     would draw the rank curve at a configuration the search may already have
-    rejected — the same objection that puts `reported_curves` at the winner
-    rather than at the defaults. Running it at the chosen rate costs nothing
-    extra: ``run_stage`` skips the point stage 1a already trained.
+    rejected — the same objection that puts the ablations at the winner rather
+    than at the defaults. Running it at the chosen rate costs nothing extra:
+    ``run_cv_stage`` skips whatever is already recorded.
 
     This is greedy coordinate descent. It does not find an interaction the way a
     full product would, and that stays in the limitations — but for the same
@@ -88,25 +88,6 @@ def tuning_grid() -> list[dict]:
             seen.add(key)
             specs.append(spec)
     return specs
-
-
-def reported_curves(winner: dict) -> list[dict]:
-    """Data-size and masking runs, at the winning configuration.
-
-    The winner's own data-size point (the full corpus) and masking setting
-    (masked) already exist from stage 1, so they are not repeated.
-
-    Early stopping is not set here: it is on globally, and stating it per-axis
-    would invite the two to drift apart.
-    """
-    runs = []
-    for size in config.DATA_SIZE_SWEEP:
-        if size is not None:
-            runs.append({**winner, "data_size": size})
-    for masking in config.MASKING_SWEEP:
-        if masking != "masked":
-            runs.append({**winner, "masking": masking})
-    return runs
 
 
 def run_name(spec: dict) -> str:
@@ -140,7 +121,7 @@ def assert_stage_complete(specs: list[dict], stage: str = "stage") -> None:
         f"{stage} is incomplete: {missing} not recorded. Selecting now would "
         f"choose from a partial sweep, and anything run at that choice would "
         f"have to be repeated if a missing run turns out to win. Finish the "
-        f"stage first — run_stage skips what is already done.")
+        f"stage first — run_cv_stage skips what is already done.")
 
 
 def select_winner(records: list[dict]) -> dict:
@@ -277,18 +258,27 @@ def select_winner_cv(records: list[dict]) -> dict:
     return {"rank": best[0], "learning_rate": best[1]}
 
 
-def final_spec(winner: dict) -> dict:
-    """The one model the results are reported from.
+def final_specs(winner: dict) -> list[dict]:
+    """The two LoRA arms the results are reported from.
 
-    Trained on the whole pool minus a validation slice, then measured once on
-    the test set. Named ``lora_r{rank}`` with no fold suffix, because there is
-    exactly one — which is what the README's load snippet promises and what the
-    fold design could not provide.
+    Each is trained on the whole pool minus a validation slice, then measured
+    **once** on the test set. Named ``lora_r{rank}`` with no fold suffix,
+    because there is exactly one adapter per arm — which is what the README's
+    load snippet promises and what the fold design could not provide.
+
+    **The ranks come from the pre-registration, not from the sweep.** They name
+    the arms; letting a winning rank of 4 rename them would change the
+    experiment after seeing results. The sweep supplies the learning rate, and
+    the rank question is answered by the CV curve over {4, 8, 16}.
+
+    Both arms see the same pool and the same validation slice, so ``lora_r8`` vs
+    ``lora_r16`` isolates adapter capacity and nothing else — which the 5-fold
+    version could not do, since it compared one fold's r8 against one fold's r16
+    and the difference also carried which poems each had seen.
     """
-    rank = int(winner["rank"])
-    return {"rank": rank,
-            "learning_rate": float(winner["learning_rate"]),
-            "run": f"lora_r{rank}"}
+    lr = float(winner.get("learning_rate", config.LEARNING_RATE))
+    return [{"rank": rank, "learning_rate": lr, "run": f"lora_r{rank}"}
+            for rank in config.LORA_ARM_RANKS]
 
 
 def load_completed() -> dict:
@@ -341,102 +331,6 @@ def already_done(spec: dict, completed: dict) -> bool:
     return True
 
 
-def final_specs(winner: dict) -> list[dict]:
-    """The six runs the results are reported from.
-
-    Five ``lora_r8``, one per fold — this is the cross-validation, and it is the
-    number 5-fold was bought for: how much the result moves with *which* poems
-    were trained on. Plus one ``lora_r16`` on the single-split fold, so
-    ``lora_r8`` vs ``lora_r16`` compares fold-1 against fold-1 rather than a
-    fold-averaged r8 against a single-split r16.
-
-    **The ranks are fixed at 8 and 16 regardless of what the sweep chose.** They
-    name the pre-registered arms; the sweep supplies the learning rate. Letting
-    a winning rank of 4 rename the arms would change the experiment after seeing
-    results, which is the freedom the pre-registration exists to remove — and
-    the rank question is answered by the reported curve, not by the arms.
-    """
-    lr = winner.get("learning_rate", config.LEARNING_RATE)
-    specs = [{"rank": 8, "learning_rate": lr, "fold": fold,
-              "run": f"lora_r8_fold{fold}"} for fold in range(config.N_FOLDS)]
-    specs.append({"rank": 16, "learning_rate": lr,
-                  "fold": config.SINGLE_SPLIT_FOLD,
-                  "run": f"lora_r16_fold{config.SINGLE_SPLIT_FOLD}"})
-    return specs
-
-
-def run_stage(specs: list[dict], pairs: list[dict], stage: str,
-              save_adapters: bool = True,
-              requires: tuple[str, ...] = (),
-              max_runs: int | None = None) -> list[dict]:
-    """Run every spec not already recorded, and return all records for them.
-
-    Args:
-        save_adapters: on by default. Adapters are keyed on the run name, so
-            sweep configurations no longer collide the way ``(rank, fold)``
-            made them, and every row in ``runs.csv`` stays traceable to the
-            weights that produced it.
-    """
-    done = load_completed()
-
-    # A row can match on name and configuration and still be unusable, because
-    # it predates a column the stage needs. The day-3 pilot is exactly that: it
-    # is recorded as lora_r8_fold0 at the default learning rate, but ran before
-    # heldout_perplexity existed. If the sweep happens to pick that same
-    # configuration, skipping it would leave H4 without a value for that fold
-    # and nothing would complain.
-    def usable(spec: dict) -> bool:
-        if not already_done(spec, done):
-            return False
-        row = done[spec.get("run") or run_name(spec)]
-        absent = [f for f in requires if row.get(f) in (None, "", "None")]
-        if absent:
-            log.info("%s exists but is missing %s; re-running",
-                     row["run"], ", ".join(absent))
-            return False
-        return True
-
-    pending = [s for s in specs if not usable(s)]
-
-    # Counted BEFORE the batch limit is applied. Reporting after it made
-    # `len(specs) - len(pending)` treat the untouched remainder as finished
-    # work: with 3 of 6 recorded and max_runs=1 it announced "5 already
-    # recorded, 1 to run", which reads as almost done rather than half done.
-    recorded = len(specs) - len(pending)
-
-    # Batching exists because RESULTS_DIR does not survive a session on either
-    # Kaggle or Colab. A stage that runs for hours and is cut off loses every
-    # row it wrote; running a few at a time bounds that to the current batch.
-    if max_runs is not None and len(pending) > max_runs:
-        log.warning("%d pending; doing %d this batch. Archive %s before "
-                    "starting the next one — it does not survive the session.",
-                    len(pending), max_runs, config.RUNS_CSV_PATH.name)
-        pending = pending[:max_runs]
-
-    log.info("%s: %d run(s), %d already recorded, %d still to run, "
-             "%d in this batch", stage, len(specs), recorded,
-             len(specs) - recorded, len(pending))
-
-    for index, spec in enumerate(pending, 1):
-        name = spec.get("run") or run_name(spec)
-        log.info("[%s %d/%d] %s", stage, index, len(pending), name)
-        run_one(spec, pairs, fold=spec.get("fold"),
-                save_adapter=save_adapters)
-
-    import csv
-    from pathlib import Path
-
-    path = Path(config.RUNS_CSV_PATH)
-    if not path.exists():
-        return []
-    wanted = {s.get("run") or run_name(s) for s in specs}
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = [row for row in csv.DictReader(handle) if row["run"] in wanted]
-    # Newest per name wins: a re-run at a different configuration appends
-    # rather than replacing, so the earlier row must not be returned as well.
-    return list({row["run"]: row for row in rows}.values())
-
-
 #: Columns that must come back as ``int``, not ``float``. CSV round-trips
 #: everything as text, and a blanket ``float()`` turns rank 16 into 16.0 — which
 #: propagates through select_winner into ``LoraConfig(r=16.0)`` and dies deep
@@ -472,52 +366,6 @@ def coerce(records: list[dict]) -> list[dict]:
                     pass
         out.append(row)
     return out
-
-
-def run_one(spec: dict, pairs: list[dict], fold: int | None = None,
-            save_adapter: bool = False):
-    """Train one sweep configuration and return its ``runs.csv`` record.
-
-    Everything is rebuilt per run — model, adapters, optimiser — because an
-    adapter carried between runs would make each one a continuation of the last
-    rather than an independent configuration.
-    """
-    from src.data import splits
-    from src.model import setup
-    from src.train import dataset, loop
-
-    fold = config.SINGLE_SPLIT_FOLD if fold is None else fold
-    rank = spec.get("rank", config.LORA_RANK)
-    setup.assert_matched_learning_rate(
-        "lora", spec.get("learning_rate", config.LEARNING_RATE))
-
-    # NOT an inline p.get("fold_id") comparison: the pairs file carries no
-    # fold_id, so that test is true for every poem and the held-out fold ends
-    # up in training. splits.training_partition asserts the filter bit.
-    training = splits.training_partition(pairs, fold)
-    if spec.get("data_size"):
-        # Sorted by id first, so the subset is deterministic rather than
-        # whatever order the corpus happened to arrive in.
-        training = sorted(training, key=lambda p: p["poem_id"])[:spec["data_size"]]
-
-    tokenizer = setup.load_tokenizer()
-    model = setup.apply_lora(setup.load_base_model(), rank=rank)
-    examples = dataset.build_dataset(training, tokenizer)
-
-    return loop.train(
-        model, tokenizer, examples, pairs,
-        run_name=spec.get("run") or run_name(spec),
-        fold=fold,
-        save_adapter=save_adapter,
-        # None, not False: an absent key must fall through to the config
-        # default (on), not silently disable early stopping for every grid run.
-        early_stopping=spec.get("early_stopping"),
-        rank=rank,
-        learning_rate=spec.get("learning_rate", config.LEARNING_RATE),
-        # Threaded through, or the unmasked run trains masked and the axis
-        # reports a comparison that never happened.
-        masking=spec.get("masking", "masked"),
-    )
 
 
 def run_cv_fold(spec: dict, pairs: list[dict], save_adapter: bool = True):
@@ -557,7 +405,7 @@ def run_cv_fold(spec: dict, pairs: list[dict], save_adapter: bool = True):
 
 
 def run_final(spec: dict, pairs: list[dict], save_adapter: bool = True):
-    """The one model the results are reported from.
+    """One of the two LoRA arms the results are reported from.
 
     Trains on the pool minus a validation slice, and is measured **once** on the
     test set — the only time any model sees it.
@@ -595,6 +443,121 @@ def run_final(spec: dict, pairs: list[dict], save_adapter: bool = True):
     )
 
 
+# --- ablations ----------------------------------------------------------------
+#
+# Neither of these feeds H1-H4. They are reportable findings in their own right,
+# and both are measured on the SAME test set as the final model so the numbers
+# sit on one scale.
+
+def ablation_specs(winner: dict) -> list[dict]:
+    """Data-size and masking runs, at the winning configuration.
+
+    **Data size** puts points either side of LIMA's 1,000-example threshold, so
+    the comparison is where our curve flattens relative to theirs rather than
+    merely that we also used few examples. The full-corpus point is the
+    ``lora_r8`` arm itself and is not repeated.
+
+    **Masking** is the only empirical check that ``completion_only_loss`` does
+    what the project assumes. H1, H2 and H3 all rest on the model being scored
+    on the interpretation and not on the poem; the tests verify the flag reaches
+    TRL, and this verifies it changes the result.
+
+    Both run at the tuned learning rate rather than the default: a curve drawn
+    at a configuration the search rejected describes a model nobody will train.
+    """
+    # At the PRIMARY arm, not at the winning rank. The curve's right-hand end
+    # has to be a run that already exists, and the full-pool run at this rank is
+    # `lora_r8` — the arm H1-H3 are stated about. Drawing it at a winning rank
+    # of 4 would leave the n=full point belonging to no reported model.
+    rank = config.PRIMARY_LORA_RANK
+    lr = float(winner["learning_rate"])
+    specs = [{"rank": rank, "learning_rate": lr, "data_size": size,
+              "run": f"ablation_n{size}"}
+             for size in config.DATA_SIZE_SWEEP if size is not None]
+    specs += [{"rank": rank, "learning_rate": lr, "masking": masking,
+               "run": f"ablation_{masking}"}
+              for masking in config.MASKING_SWEEP if masking != "masked"]
+    return specs
+
+
+def run_ablation(spec: dict, pairs: list[dict], save_adapter: bool = True):
+    """One ablation run, trained on the pool and measured on the test set.
+
+    The test set is the same one the final model is measured on, so a data-size
+    curve and the final number sit on one scale. Nothing here touches it during
+    training — ``pool_partition`` excludes it, and ``run_final`` asserts the two
+    do not overlap.
+    """
+    from src.data import splits
+    from src.model import setup
+    from src.train import dataset, loop
+
+    rank = int(spec["rank"])
+    setup.assert_matched_learning_rate("lora", spec["learning_rate"])
+
+    pool = splits.pool_partition(pairs)
+    if spec.get("data_size"):
+        # Sorted by id first, so the subset is deterministic rather than
+        # whatever order the corpus arrived in. Authors are NOT kept whole here:
+        # the question is how much data helps, and holding authors together
+        # would confound size with author coverage.
+        pool = sorted(pool, key=lambda p: p["poem_id"])[:spec["data_size"]]
+        log.info("ablation on %d poems", len(pool))
+
+    test = splits.test_partition(pairs)
+    assert not ({p["poem_id"] for p in pool} & {p["poem_id"] for p in test}), (
+        "the training subset overlaps the test set")
+
+    tokenizer = setup.load_tokenizer()
+    model = setup.apply_lora(setup.load_base_model(), rank=rank)
+
+    return loop.train(
+        model, tokenizer, dataset.build_dataset(pool, tokenizer), pairs,
+        run_name=spec["run"],
+        save_adapter=save_adapter,
+        heldout=dataset.build_dataset(test, tokenizer),
+        prefer_unused=splits.untouched_authors(pairs),
+        early_stopping=spec.get("early_stopping"),
+        rank=rank,
+        learning_rate=spec["learning_rate"],
+        # Threaded through, or the unmasked run trains masked and the axis
+        # reports a comparison that never happened.
+        masking=spec.get("masking", "masked"),
+    )
+
+
+def run_ablation_stage(pairs: list[dict], winner: dict,
+                       max_runs: int | None = None) -> list[dict]:
+    """Run every ablation not already recorded."""
+    import csv
+    from pathlib import Path
+
+    specs = ablation_specs(winner)
+    done = load_completed()
+    pending = [s for s in specs if s["run"] not in done]
+    recorded = len(specs) - len(pending)
+
+    if max_runs is not None and len(pending) > max_runs:
+        log.warning("%d pending; doing %d this batch.", len(pending), max_runs)
+        pending = pending[:max_runs]
+
+    log.info("ablations: %d run(s), %d already recorded, %d still to run, "
+             "%d in this batch", len(specs), recorded, len(specs) - recorded,
+             len(pending))
+
+    for index, spec in enumerate(pending, 1):
+        log.info("[ablation %d/%d] %s", index, len(pending), spec["run"])
+        run_ablation(spec, pairs)
+
+    path = Path(config.RUNS_CSV_PATH)
+    if not path.exists():
+        return []
+    wanted = {s["run"] for s in specs}
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = [r for r in csv.DictReader(handle) if r["run"] in wanted]
+    return list({r["run"]: r for r in rows}.values())
+
+
 def run_cv_stage(pairs: list[dict], max_runs: int | None = None) -> list[dict]:
     """Run every (configuration, fold) tuning run not already recorded."""
     import csv
@@ -628,22 +591,30 @@ def run_cv_stage(pairs: list[dict], max_runs: int | None = None) -> list[dict]:
     return list({r["run"]: r for r in rows}.values())
 
 
-def plan() -> dict:
-    """What the sweep will run, without running it.
+def plan(winner: dict | None = None) -> dict:
+    """What the whole GPU programme will run, without running it.
 
-    Printed before a GPU session starts, because a sweep whose size is only
+    Printed before a session starts, because a sweep whose size is only
     discovered halfway through is a sweep that gets abandoned halfway through.
+
+    ``winner`` is only needed for the ablation names; the *count* is the same
+    whichever configuration wins, so the defaults stand in when planning ahead
+    of the tuning stage.
     """
-    grid = tuning_grid()
-    curves = reported_curves({"rank": config.LORA_RANK,
-                              "learning_rate": config.LEARNING_RATE})
+    winner = winner or {"rank": config.LORA_RANK,
+                        "learning_rate": config.LEARNING_RATE}
+    tuning = cv_specs()
+    final = final_specs(winner)
+    ablations = ablation_specs(winner)
     return {
-        "tuning_runs": len(grid),
-        "curve_runs": len(curves),
-        "total": len(grid) + len(curves),
-        "grid": [run_name(s) for s in grid],
-        "curves": [run_name(s) for s in curves],
+        "tuning_runs": len(tuning),
+        "final_runs": len(final),
+        "ablation_runs": len(ablations),
+        "total": len(tuning) + len(final) + len(ablations),
+        "tuning": [s["run"] for s in tuning],
+        "final": [s["run"] for s in final],
+        "ablations": [s["run"] for s in ablations],
         "selection": f"{config.SWEEP_SELECTION_METRIC}, "
                      f"{'lower' if config.SWEEP_SELECTION_LOWER_IS_BETTER else 'higher'}"
-                     f" is better, ties to fewer trainable params",
+                     f" is better, averaged over {config.TUNING_FOLDS} folds",
     }
