@@ -610,3 +610,155 @@ def author_signal(corpus: list[dict], seed: int | None = None):
                  fontsize=10, y=1.03)
     fig.tight_layout()
     return save(fig, "02e_author_signal")
+
+
+# --- results figures ----------------------------------------------------------
+
+def loss_curves(runs: "object", histories: dict, name: str = "03_loss_curves"):
+    """Figure 3 — train and validation loss per run.
+
+    Validation is drawn with markers at the points it was actually evaluated,
+    because early stopping chose among exactly those and a smooth line implies
+    a continuous curve nobody measured. The stopping point is marked, so a run
+    that stopped on its own curve is distinguishable from one that spent its
+    whole budget.
+    """
+    style()
+    names = list(histories)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.4 * len(names), 3.6),
+                             sharey=True, squeeze=False)
+    for ax, run in zip(axes[0], names):
+        history = histories[run]
+        train = [(h["step"], h["loss"]) for h in history if "loss" in h]
+        val = [(h["step"], h["eval_loss"]) for h in history if "eval_loss" in h]
+        if train:
+            ax.plot(*zip(*train), color=PALETTE["primary"], linewidth=1.4,
+                    label="train")
+        if val:
+            ax.plot(*zip(*val), color=PALETTE["accent"], marker="o",
+                    markersize=3.5, linewidth=1.2, label="validation")
+            best = min(val, key=lambda p: p[1])
+            ax.axvline(best[0], color=PALETTE["reference"], linestyle="--",
+                       linewidth=1, label=f"best @ {best[0]}")
+        ax.set_title(run)
+        ax.set_xlabel("optimiser step")
+        ax.legend()
+    axes[0][0].set_ylabel("cross-entropy loss")
+    fig.suptitle("Training and validation loss. Validation is marked at the "
+                 "steps it was measured;\nearly stopping chose among exactly "
+                 "those, and the best weights were restored before evaluation.",
+                 y=1.06, fontsize=9.5, fontweight="normal")
+    return save(fig, name)
+
+
+def arm_metrics(summary: "object", name: str = "04_arm_metrics"):
+    """Figure 4 — format compliance and grounding rate by arm, with 95% CIs.
+
+    Three panels, because the headline grounding number is all-or-nothing and
+    that penalises an arm for quoting MORE. The per-quote rate and the quote
+    count sit beside it so a reader can see which mechanism moved.
+    """
+    from src.eval import metrics
+
+    style()
+    arms = list(summary["arm"])
+    colours = [PALETTE.get(a, PALETTE["secondary"]) for a in arms]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
+
+    for ax, (column, count, title) in zip(axes, [
+        ("format_rate", "format_compliant", "Format compliance\n(four-part schema)"),
+        ("grounding_rate", "grounded", "Grounding rate\n(EVERY quote exact)"),
+        ("exact_quote_rate", None, "Exact quotes\n(per quote, not per output)"),
+    ]):
+        values = list(summary[column])
+        ax.bar(arms, values, color=colours)
+        if count is not None:
+            lo, hi = zip(*[metrics.binomial_ci(int(s), int(n))
+                           for s, n in zip(summary[count], summary["n"])])
+            # Clamped at zero. A Wilson interval on a rate of exactly 1.0
+            # can return an upper bound a float-epsilon BELOW it, and
+            # matplotlib rejects a negative error bar outright — so the arm
+            # with perfect compliance is the one that would crash the figure.
+            ax.errorbar(arms, values, fmt="none", capsize=3, linewidth=1.1,
+                        color="#333",
+                        yerr=[[max(0.0, v - l) for v, l in zip(values, lo)],
+                              [max(0.0, h - v) for v, h in zip(values, hi)]])
+        ax.set_title(title)
+        ax.set_ylim(0, 1.05)
+        ax.tick_params(axis="x", rotation=30)
+    axes[0].set_ylabel("rate")
+    fig.suptitle("Model-free metrics by arm, 95% Wilson intervals. No judge is "
+                 "involved in any of these.", y=1.04, fontsize=9.5,
+                 fontweight="normal")
+    return save(fig, name)
+
+
+def saturation(curve: "object", rank_folds: dict,
+               name: str = "10_saturation"):
+    """Figure 10 — does performance saturate with rank, and with data?
+
+    The rank panel shows every fold, not the mean. On a mean-only plot the
+    y-axis spans 0.008 of loss, and a negligible effect renders as a steep
+    climb — the within-fold spread is several times the between-rank
+    difference, and a reader has to be able to see that.
+
+    Both panels carry a published reference line. LIMA's 1,000 examples marks
+    where Zhou et al. reported curated data sufficing; the rank panel is the
+    comparison against Hu et al.'s low-rank saturation finding.
+
+    The data panel plots format AND grounding together deliberately. Their
+    divergence is the finding: if form saturates while substance does not, the
+    superficial-alignment reading holds for one and fails for the other.
+    """
+    style()
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11.5, 4))
+
+    # **Every fold plotted, not just the mean.** On a mean-only plot the
+    # y-axis spans 0.008 of loss and a negligible rank effect renders as a
+    # steep climb — the figure would tell the opposite story from the data.
+    # The within-configuration spread across folds is ~6x the between-rank
+    # difference, and showing both is the whole finding.
+    ranks = sorted(rank_folds)
+    for rank in ranks:
+        left.scatter([rank] * len(rank_folds[rank]), rank_folds[rank],
+                     color=PALETTE["primary"], alpha=0.45, s=26, zorder=3)
+    means = [sum(rank_folds[r]) / len(rank_folds[r]) for r in ranks]
+    left.plot(ranks, means, marker="_", markersize=22, markeredgewidth=2.4,
+              color=PALETTE["accent"], linewidth=1.4, zorder=4, label="mean")
+    spread = max(max(v) for v in rank_folds.values()) - \
+        min(min(v) for v in rank_folds.values())
+    left.annotate(f"fold spread {spread:.3f}\nrank spread "
+                  f"{max(means) - min(means):.3f}",
+                  xy=(0.04, 0.06), xycoords="axes fraction", fontsize=8.5,
+                  color="#555")
+    left.set_xscale("log", base=2)
+    left.set_xticks(ranks)
+    left.set_xticklabels(ranks)
+    left.set_xlabel("LoRA rank")
+    left.set_ylabel("validation loss")
+    left.legend(loc="upper left")
+    left.set_title("Rank: every tuning fold, one rate")
+
+    right.plot(curve["n_train"], curve["format_rate"], marker="s",
+               color=PALETTE["secondary"], linewidth=1.6,
+               label="format compliance")
+    right.plot(curve["n_train"], curve["grounding_rate"], marker="o",
+               color=PALETTE["accent"], linewidth=1.6, label="grounding rate")
+    right.axvline(1000, color=PALETTE["reference"], linestyle="--", linewidth=1)
+    right.text(1030, 0.80, "LIMA: 1,000", color=PALETTE["reference"],
+               fontsize=8.5, rotation=90, va="center")
+    for x, a in zip(curve["n_train"], curve["authors"]):
+        right.annotate(f"{a}\nauthors", (x, 0.06), fontsize=7.5, ha="center",
+                       color="#666", linespacing=0.95)
+    right.set_xscale("log")
+    right.set_xlabel("training examples")
+    right.set_ylabel("rate")
+    right.set_ylim(-0.02, 1.12)
+    right.legend(loc="center left")
+    right.set_title("Data size: form vs substance")
+
+    fig.suptitle("Saturation. Author coverage rises with data size (annotated), "
+                 "so the right panel\ncannot separate volume from coverage — "
+                 "though format is flat across both.",
+                 y=1.05, fontsize=9.5, fontweight="normal")
+    return save(fig, name)

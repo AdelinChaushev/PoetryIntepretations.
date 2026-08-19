@@ -352,3 +352,109 @@ def assert_single_judge(results: list[Result]) -> None:
         f"results from {sorted(judges)} cannot be aggregated. Report the "
         f"primary judge's number as the result and the secondary beside it — "
         f"averaging them hides a disagreement that is itself a finding.")
+
+
+# --- model-free measurement ---------------------------------------------------
+#
+# Format compliance and grounding cost nothing: a schema check and a substring
+# match, no model and no judge. They run first for that reason — a bug in the
+# generations surfaces here rather than after 4,560 paid calls.
+#
+# They also settle H1 and H2 outright. Those two are pre-registered as
+# two-proportion z-tests over exactly these rates, and CLAUDE.md frames the
+# comparison against Gudibande as "the same split, with a MECHANICAL grounding
+# check" in place of their human raters. No judge is involved in either.
+
+def model_free_summary(outputs: list[dict], corpus: list[dict],
+                       arms=None) -> "object":
+    """Per-arm format compliance, grounding and verbosity.
+
+    Args:
+        outputs: arm output records, each with ``poem_id``, ``arm`` and
+            ``interpretation``.
+        corpus: poems, used to check quotations against the right text.
+        arms: which arms to include, in order. Defaults to ``config.ARMS``.
+
+    Two grounding numbers are reported and they answer different questions.
+    ``grounding_rate`` is per INTERPRETATION and all-or-nothing — every quote
+    must hold — which is the pre-registered H2 quantity. ``exact_quote_rate`` is
+    per QUOTE. An arm that quotes more often is held to a stricter bar by the
+    first, so reporting only that would penalise exactly the behaviour
+    fine-tuning is supposed to produce.
+
+    ``quoted_nothing`` matters for the same reason. An interpretation with no
+    quotations is scored ungrounded, because it dodged the question rather than
+    answering it — so an arm can score badly either by quoting wrongly or by
+    declining to quote, and those are different failures.
+    """
+    import pandas as pd
+
+    from src.eval import format_check, grounding
+
+    by_id = {p["poem_id"]: p for p in corpus}
+    rows = []
+    for arm in (config.ARMS if arms is None else arms):
+        records = [r for r in outputs if r["arm"] == arm]
+        if not records:
+            continue
+        missing = [r["poem_id"] for r in records if r["poem_id"] not in by_id]
+        assert not missing, (
+            f"{arm}: {len(missing)} output(s) have no poem in the corpus, so "
+            f"their quotations cannot be checked: {missing[:5]}")
+
+        checks = [grounding.check(r["interpretation"], by_id[r["poem_id"]])
+                  for r in records]
+        texts = [r["interpretation"] for r in records]
+        words = sorted(len(t.split()) for t in texts)
+        n, quotes = len(records), sum(c["n_quotes"] for c in checks)
+        compliant = sum(format_check.is_compliant(t) for t in texts)
+        grounded = sum(c["grounded"] for c in checks)
+
+        rows.append({
+            "arm": arm,
+            "n": n,
+            "format_compliant": compliant,
+            "format_rate": compliant / n,
+            "grounded": grounded,
+            "grounding_rate": grounded / n,
+            "quoted_nothing": sum(1 for c in checks if c["n_quotes"] == 0),
+            "quotes": quotes,
+            "exact_quotes": sum(c["n_grounded"] for c in checks),
+            "exact_quote_rate": (sum(c["n_grounded"] for c in checks) / quotes
+                                 if quotes else float("nan")),
+            "quotes_per_interpretation": quotes / n,
+            "median_words": words[n // 2],
+        })
+    return pd.DataFrame(rows)
+
+
+def compare_to_baseline(summary, column: str, baseline: str,
+                        arms=None, name: str = "") -> list[Result]:
+    """Two-proportion z-tests of ``column`` for each arm against ``baseline``.
+
+    ``column`` names the RATE (``format_rate`` or ``grounding_rate``); the
+    counts come from the matching ``format_compliant`` / ``grounded`` column, so
+    the test is run on integers rather than on a rounded proportion.
+
+    Returns one :class:`Result` per arm, each carrying the difference in
+    proportions and its confidence interval alongside the p-value — a bare
+    p-value cannot say whether a difference matters.
+    """
+    counts = {"format_rate": "format_compliant", "grounding_rate": "grounded"}
+    assert column in counts, f"{column!r} has no count column; expected {list(counts)}"
+    successes = counts[column]
+
+    indexed = summary.set_index("arm")
+    assert baseline in indexed.index, f"{baseline!r} is not in the summary"
+    base = indexed.loc[baseline]
+
+    results = []
+    for arm in (indexed.index if arms is None else arms):
+        if arm == baseline:
+            continue
+        row = indexed.loc[arm]
+        results.append(two_proportion_test(
+            int(row[successes]), int(row["n"]),
+            int(base[successes]), int(base["n"]),
+            name=f"{name or column} — {arm} vs {baseline}"))
+    return results

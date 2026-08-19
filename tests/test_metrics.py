@@ -212,3 +212,93 @@ def test_the_frame_carries_effects_and_intervals_not_just_p_values():
                                                           name="H1")])
     for column in ("effect", "ci_low", "ci_high", "p_value", "verdict"):
         assert column in frame.columns
+
+
+# --- model-free summary -------------------------------------------------------
+
+def corpus_fixture():
+    return [{"poem_id": 1, "author": "A", "title": "T",
+             "lines": ["the cat sat down", "upon the mat today"]},
+            {"poem_id": 2, "author": "B", "title": "U",
+             "lines": ["a bird flew high", "over the quiet hill"]}]
+
+
+def outputs_fixture():
+    grounded = ('1. Central idea - about cats.\n'
+                '2. Key images - "the cat sat down" and "upon the mat today".\n'
+                '3. Tone - calm.\n'
+                '4. Interpretive claim - it is about rest.')
+    hallucinated = ('1. Central idea - about dogs.\n'
+                    '2. Key images - "the dog ran away fast".\n'
+                    '3. Tone - brisk.\n'
+                    '4. Interpretive claim - it is about motion.')
+    silent = "It is a poem about many things, broadly speaking and at length."
+    return [{"poem_id": 1, "arm": "good", "interpretation": grounded},
+            {"poem_id": 2, "arm": "good", "interpretation": grounded.replace(
+                "the cat sat down", "a bird flew high").replace(
+                "upon the mat today", "over the quiet hill")},
+            {"poem_id": 1, "arm": "bad", "interpretation": hallucinated},
+            {"poem_id": 2, "arm": "bad", "interpretation": silent}]
+
+
+def test_grounding_is_all_or_nothing_per_interpretation():
+    """The pre-registered H2 quantity. An arm that quotes more often is held to
+    a stricter bar, which is why the per-quote rate is reported beside it."""
+    from src.eval import metrics
+
+    s = metrics.model_free_summary(outputs_fixture(), corpus_fixture(),
+                                   arms=("good", "bad"))
+    good = s.set_index("arm").loc["good"]
+    assert good["grounded"] == 2 and good["grounding_rate"] == 1.0
+    assert s.set_index("arm").loc["bad"]["grounded"] == 0
+
+
+def test_quoting_nothing_counts_as_ungrounded():
+    """It dodged the question rather than answering it. Treating it as a pass
+    would reward exactly the vague, unquotable output the project detects."""
+    from src.eval import metrics
+
+    s = metrics.model_free_summary(outputs_fixture(), corpus_fixture(),
+                                   arms=("bad",)).iloc[0]
+    assert s["quoted_nothing"] == 1
+    assert s["grounding_rate"] == 0.0
+
+
+def test_an_output_with_no_poem_raises():
+    """Its quotations cannot be checked, and scoring it against nothing would
+    silently record a hallucination."""
+    from src.eval import metrics
+
+    stray = outputs_fixture() + [{"poem_id": 99, "arm": "good",
+                                  "interpretation": "x"}]
+    try:
+        metrics.model_free_summary(stray, corpus_fixture(), arms=("good",))
+    except AssertionError as error:
+        assert "no poem in the corpus" in str(error)
+        return
+    raise AssertionError("an output with no poem was summarised anyway")
+
+
+def test_comparison_runs_on_counts_not_rounded_rates():
+    """A z-test fed a rounded proportion is a z-test on the wrong number."""
+    from src.eval import metrics
+
+    s = metrics.model_free_summary(outputs_fixture(), corpus_fixture(),
+                                   arms=("good", "bad"))
+    results = metrics.compare_to_baseline(s, "grounding_rate", baseline="bad")
+    assert len(results) == 1
+    assert results[0].n == 4                      # 2 + 2, the integer counts
+    assert results[0].effect == 1.0               # 100% vs 0%
+
+
+def test_comparing_an_unknown_column_raises():
+    from src.eval import metrics
+
+    s = metrics.model_free_summary(outputs_fixture(), corpus_fixture(),
+                                   arms=("good", "bad"))
+    try:
+        metrics.compare_to_baseline(s, "median_words", baseline="bad")
+    except AssertionError as error:
+        assert "count column" in str(error)
+        return
+    raise AssertionError("a column with no success count was tested anyway")
