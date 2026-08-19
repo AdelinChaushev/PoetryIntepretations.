@@ -641,7 +641,7 @@ def test_the_batch_limit_does_not_inflate_the_recorded_count(caplog, tmp_path,
                                                     "learning_rate"])
         writer.writeheader()
         winner = {"rank": 8, "learning_rate": 1e-4}
-        for spec in sweep.ablation_specs(winner)[:3]:   # 3 of the 4 ablations
+        for spec in sweep.ablation_specs(winner)[:1]:   # 1 of the 3 ablations
             writer.writerow({"run": spec["run"], "rank": 8,
                              "learning_rate": 1e-4})
     monkeypatch.setattr(config, "RUNS_CSV_PATH", path)
@@ -651,9 +651,13 @@ def test_the_batch_limit_does_not_inflate_the_recorded_count(caplog, tmp_path,
         sweep.run_ablation_stage([], {"rank": 8, "learning_rate": 1e-4},
                                  max_runs=1)
 
+    # Counted BEFORE the truncation. The bug reported the untouched remainder
+    # as finished work, so this said "2 already recorded, 1 still to run" when
+    # only one was actually done.
     line = next(m for m in caplog.messages if "already recorded" in m)
-    assert "3 already recorded" in line, line
-    assert "1 still to run" in line, line
+    assert "1 already recorded" in line, line
+    assert "2 still to run" in line, line
+    assert "1 in this batch" in line, line
 
 
 # --- ablations ----------------------------------------------------------------
@@ -758,9 +762,10 @@ def test_every_ablation_is_scored_on_the_same_test_set(monkeypatch):
         assert seen.get("fold") is None, "an ablation is not a fold"
 
 
-def test_the_unmasked_ablation_trains_on_the_whole_pool(monkeypatch):
-    """It varies masking and nothing else, so it must see exactly what the
-    final model sees."""
+def test_an_unmasked_run_would_train_on_the_whole_pool(monkeypatch):
+    """MASKING_SWEEP no longer emits one, but `masking` still reaches TRL from
+    training_arguments, so the runner's forwarding stays under test — a dead
+    parameter that silently stops working is how the axis died the first time."""
     from src.train import sweep
 
     pairs = ablation_pairs()

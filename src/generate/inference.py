@@ -79,9 +79,46 @@ def adapter_for(arm: str) -> "object | None":
         return None
 
     rank = next((r for r in config.LORA_ARM_RANKS if arm == f"lora_r{r}"), None)
-    if rank is None:
-        raise ValueError(f"unknown arm {arm!r}; expected one of {config.ARMS}")
-    return config.adapter_dir(rank)
+    if rank is not None:
+        return config.adapter_dir(rank)
+
+    # Ablation arms are model-free-metrics only. Resolved by run name, and only
+    # for names config lists — an unknown arm must still raise rather than
+    # return None, which would generate it from the base model and label the
+    # output as fine-tuned.
+    if arm in config.ABLATION_ARMS:
+        return config.run_adapter_dir(arm)
+
+    raise ValueError(f"unknown arm {arm!r}; expected one of "
+                     f"{config.ARMS + config.ABLATION_ARMS}")
+
+
+def model_loader(base=None):
+    """Build the ``load_model`` callable :func:`generate_arm` expects.
+
+    Untrained arms share one base model — they differ only in the prompt, so
+    reloading between them would waste a minute for nothing.
+
+    **Every LoRA arm gets a FRESH base.** ``PeftModel.from_pretrained`` wraps
+    the module it is handed rather than copying it, so passing one object
+    through two adapters leaves the second arm generating from *both*. Nothing
+    raises: the run completes, the outputs are fluent, and ``lora_r16`` silently
+    becomes a blend nobody trained. At 0.5B a reload costs seconds; the failure
+    costs the arm.
+    """
+    from src.model import setup
+
+    cache = {"base": base}
+
+    def load(adapter):
+        if adapter is None:
+            if cache["base"] is None:
+                cache["base"] = setup.load_base_model()
+            return cache["base"]
+        # base=None on purpose — load_adapter builds its own base.
+        return setup.load_adapter(adapter)
+
+    return load
 
 
 def generate_one(prompt: str, model, tokenizer) -> str:

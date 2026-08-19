@@ -264,3 +264,78 @@ def test_every_arm_shares_one_context_limit():
     source = inspect.getsource(inference.generate_one)
     assert source.count("GEN_MAX_CONTEXT") >= 1
     assert "arm" not in source.split("assert")[1][:400]
+
+
+# --- the model loader ---------------------------------------------------------
+
+def test_untrained_arms_share_one_base_model():
+    """They differ only in the prompt, so reloading between them buys nothing."""
+    load = inference.model_loader(base="BASE")
+    assert load(None) is load(None) is "BASE"
+
+
+def test_each_adapter_gets_a_fresh_base(monkeypatch):
+    """PeftModel.from_pretrained WRAPS the module it is handed. Reusing one base
+    across two adapters leaves the second arm generating from both — no error,
+    fluent output, and lora_r16 silently becomes a blend nobody trained."""
+    from src.model import setup
+
+    handed = []
+
+    def fake_load_adapter(path, base=None):
+        handed.append(base)
+        return f"model@{path}"
+
+    monkeypatch.setattr(setup, "load_adapter", fake_load_adapter)
+
+    load = inference.model_loader(base="BASE")
+    first = load(inference.adapter_for("lora_r8"))
+    second = load(inference.adapter_for("lora_r16"))
+
+    assert first != second
+    assert handed == [None, None], (
+        "an adapter was stacked onto a model that already had one")
+
+
+# --- ablation arms: model-free metrics only -----------------------------------
+
+def test_ablation_arms_are_not_in_ARMS():
+    """ARMS is what every judge and hypothesis path iterates. An ablation arm
+    reaching it would put an unregistered arm into H1-H3 and spend judge budget
+    on 3 x 152 x 3 x 2 pairs nobody planned for."""
+    assert not (set(config.ABLATION_ARMS) & set(config.ARMS))
+
+
+def test_ablation_arms_track_the_data_size_sweep():
+    """Derived, not written out, so they cannot drift from the runs
+    sweep.ablation_specs actually produces."""
+    from src.train import sweep
+
+    produced = {s["run"] for s in sweep.ablation_specs(
+        {"rank": 8, "learning_rate": 2e-4})}
+    assert set(config.ABLATION_ARMS) == produced
+
+
+def test_each_ablation_arm_routes_to_its_own_adapter():
+    for arm in config.ABLATION_ARMS:
+        assert inference.adapter_for(arm).name.endswith(arm)
+
+
+def test_an_unknown_ablation_arm_still_raises():
+    """The guard that keeps a typo from silently generating an arm from the
+    base model and labelling the output as fine-tuned."""
+    try:
+        inference.adapter_for("ablation_n999")
+    except ValueError as error:
+        assert "unknown arm" in str(error)
+        return
+    raise AssertionError("an arm with no adapter was routed anyway")
+
+
+def test_no_two_arms_share_an_adapter():
+    """Across every arm that has one — a shared path would silently relabel one
+    arm as another, and the data-size curve would join duplicate points."""
+    paths = [inference.adapter_for(a)
+             for a in config.ARMS + config.ABLATION_ARMS
+             if a not in inference.UNTRAINED_ARMS]
+    assert len(set(paths)) == len(paths)

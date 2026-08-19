@@ -823,7 +823,11 @@ LR_SWEEP: tuple[float, ...] = (1e-4, 2e-4)
 #: That is a comparison the design pays for anyway, not the reason the axis
 #: exists.
 DATA_SIZE_SWEEP: tuple[int | None, ...] = (200, 500, 1000, None)
-MASKING_SWEEP: tuple[str, ...] = ("masked", "unmasked")
+#: Loss masking. Only ``masked`` is swept: an unmasked run would inherit
+#: hyperparameters tuned entirely under masked loss, so the comparison confounds
+#: the objective with the configuration and cannot support a clean claim. That
+#: the masking works at all is checked directly, in tests/test_masking.py.
+MASKING_SWEEP: tuple[str, ...] = ("masked",)
 
 #: How the sweep picks a winner. Fixed HERE, before any sweep run, because
 #: choosing the criterion after seeing results is the researcher freedom the
@@ -848,6 +852,26 @@ SWEEP_SELECTION_LOWER_IS_BETTER: bool = True
 # ---------------------------------------------------------------------------
 
 ARMS: tuple[str, ...] = ("template", "base_zero", "base_few", "lora_r8", "lora_r16")
+
+#: Arms generated for the MODEL-FREE metrics only — format compliance, grounding
+#: rate and output length. Never judged, never in H1-H3, and deliberately NOT in
+#: ARMS, which is what every judge and hypothesis path iterates.
+#:
+#: They exist so the data-size curve can be read in GROUNDING RATE rather than
+#: perplexity. "Does more data improve grounding, or only format?" is the
+#: Gudibande style-versus-substance question asked along the data axis, and
+#: answering it in perplexity answers a different question. The substring
+#: checker and the schema checker need no model, so this costs generation time
+#: and nothing else.
+#:
+#: Derived from DATA_SIZE_SWEEP rather than written out, so it cannot drift from
+#: the runs sweep.ablation_specs actually produces.
+ABLATION_ARMS: tuple[str, ...] = tuple(f"ablation_n{n}"
+                                       for n in DATA_SIZE_SWEEP if n)
+
+assert not (set(ABLATION_ARMS) & set(ARMS)), (
+    "an ablation arm is in ARMS; it would reach the judge and the hypothesis "
+    "tests, which are pre-registered over the five arms only")
 
 #: The ranks the two LoRA arms are trained at. **Pre-registered, and NOT taken
 #: from whatever the sweep chose.** They name the arms; letting a winning rank

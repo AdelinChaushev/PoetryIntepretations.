@@ -435,18 +435,16 @@ def test_every_runner_forwards_the_masking_axis():
             runner), runner.__name__
 
 
-def test_the_masking_ablation_is_the_only_unmasked_run():
-    """One unmasked point, and it must be at the winner so the comparison is
-    against the model actually being reported."""
+def test_no_ablation_trains_unmasked():
+    """The axis is not swept. An unmasked run would inherit hyperparameters
+    tuned entirely under masked loss, so it would confound the objective with
+    the configuration — and the masking itself is checked directly above, not
+    inferred from a run."""
     from src.train import sweep
 
-    winner = {"rank": 8, "learning_rate": 2e-4}
-    unmasked = [s for s in sweep.ablation_specs(winner)
-                if s.get("masking") == "unmasked"]
-    assert len(unmasked) == 1
-    assert unmasked[0]["rank"] == 8 and unmasked[0]["learning_rate"] == 2e-4
-    assert unmasked[0].get("data_size") is None, \
-        "the masking run must use the full pool, or it varies two things"
+    specs = sweep.ablation_specs({"rank": 8, "learning_rate": 2e-4})
+    assert all(s.get("masking", "masked") == "masked" for s in specs)
+    assert config.MASKING_SWEEP == ("masked",)
 
 
 def test_the_masking_setting_is_recorded_as_a_column():
