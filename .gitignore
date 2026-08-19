@@ -79,3 +79,8 @@ CLAUDE.md
 # Transfer archives — their contents are already extracted alongside them.
 results/session_output*.zip
 results/to_download/
+
+# Tuning adapters. Never reloaded — each run rebuilds the model, and
+# runs.csv is what drives resume. ~400 MB that only lora_r8/lora_r16 need.
+results/adapters/cv_*
+results/adapters/ablation_*
