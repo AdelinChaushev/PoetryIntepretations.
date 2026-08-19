@@ -80,7 +80,10 @@ CLAUDE.md
 results/session_output*.zip
 results/to_download/
 
-# Tuning adapters. Never reloaded — each run rebuilds the model, and
-# runs.csv is what drives resume. ~400 MB that only lora_r8/lora_r16 need.
+# Tuning adapters. Never reloaded — each CV run rebuilds the model from
+# scratch, and runs.csv alone drives resume. ~200 MB that nothing reads.
+#
+# The ablation adapters are NOT ignored: they are generation arms, so the GPU
+# side loads them by name from the clone. Ignoring them meant the clone had no
+# weights to generate from and inference died on a missing adapter_config.json.
 results/adapters/cv_*
-results/adapters/ablation_*
