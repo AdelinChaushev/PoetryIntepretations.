@@ -302,3 +302,148 @@ def test_comparing_an_unknown_column_raises():
         assert "count column" in str(error)
         return
     raise AssertionError("a column with no success count was tested anyway")
+
+
+# --- H3 and H4 ----------------------------------------------------------------
+
+def scored_fixture(arm, matched, random_, same_author, judge="j1"):
+    """One arm's swap-test records: three conditions per poem."""
+    rows = []
+    for i, (m, r, s) in enumerate(zip(matched, random_, same_author)):
+        for condition, score in (("matched", m), ("mismatched_random", r),
+                                 ("mismatched_same_author", s)):
+            rows.append({"judge": judge, "arm": arm, "poem_id": i,
+                         "condition": condition, "score": score})
+    return rows
+
+
+def test_h3_detects_a_widened_gap():
+    from src.eval import metrics
+
+    weak = scored_fixture("base_few", [5] * 20, [4] * 20, [4] * 20)
+    strong = scored_fixture("lora_r8", [9] * 20, [2] * 20, [2] * 20)
+    r = metrics.h3_grounding_gap(weak + strong, arms=["lora_r8"])[0]
+    assert r.detail["mean_arm"] == 7 and r.detail["mean_baseline"] == 1
+    assert r.p_value < 0.001
+    assert r.effect > 0.9
+
+
+def test_h3_reports_no_difference_when_gaps_match():
+    """A null must read as 'no detected difference', never as equality."""
+    from src.eval import metrics
+
+    a = scored_fixture("base_few", [7] * 20, [3] * 20, [3] * 20)
+    b = scored_fixture("lora_r8", [7] * 20, [3] * 20, [3] * 20)
+    r = metrics.h3_grounding_gap(a + b, arms=["lora_r8"])[0]
+    assert r.p_value > 0.05
+    assert "no detected difference" in r.verdict()
+
+
+def test_h3_can_use_the_strict_condition():
+    """The poem-level gap is the defensible number — it survives author-prior
+    leakage, including leakage that arrived during pretraining."""
+    from src.eval import metrics
+
+    a = scored_fixture("base_few", [8] * 20, [2] * 20, [7] * 20)
+    b = scored_fixture("lora_r8", [8] * 20, [2] * 20, [1] * 20)
+    standard = metrics.h3_grounding_gap(a + b, arms=["lora_r8"],
+                                        condition="mismatched_random")[0]
+    strict = metrics.h3_grounding_gap(a + b, arms=["lora_r8"],
+                                      condition="mismatched_same_author")[0]
+    # Identical under the standard control, separated under the strict one.
+    assert standard.detail["mean_arm"] == standard.detail["mean_baseline"]
+    assert strict.detail["mean_arm"] > strict.detail["mean_baseline"]
+
+
+def test_h3_refuses_to_mix_judges():
+    """Pooling turns a robustness check into a composite nobody can interpret."""
+    from src.eval import metrics
+
+    mixed = (scored_fixture("base_few", [5] * 5, [3] * 5, [3] * 5, judge="a")
+             + scored_fixture("base_few", [5] * 5, [3] * 5, [3] * 5, judge="b")
+             + scored_fixture("lora_r8", [8] * 5, [2] * 5, [2] * 5, judge="a"))
+    try:
+        metrics.h3_grounding_gap(mixed, arms=["lora_r8"])
+    except AssertionError as error:
+        # Asserted on the JUDGE NAMES, not on the wording. Two modules define
+        # assert_single_judge with different messages, and a test pinned to one
+        # of them passes or fails on prose rather than on behaviour.
+        assert "a" in str(error) and "b" in str(error)
+        return
+    raise AssertionError("records from two judges were pooled")
+
+
+def test_h4_negative_rho_means_the_measures_agree():
+    """Lower perplexity is better and higher judge score is better, so
+    agreement is NEGATIVE correlation. Reading the sign backwards inverts the
+    conclusion, which is why the direction is recorded on the result."""
+    from src.eval import metrics
+
+    ppl = {"a": 10.0, "b": 8.0, "c": 5.0, "d": 4.0}
+    agree = {"a": 2.0, "b": 3.0, "c": 6.0, "d": 7.0}
+    r = metrics.h4_perplexity_vs_judge(ppl, agree)
+    assert r.effect == -1.0
+    assert "negative r means the two agree" in r.detail["agreement_sign"]
+
+
+def test_h4_detects_disagreeing_rankings():
+    from src.eval import metrics
+
+    ppl = {"a": 10.0, "b": 8.0, "c": 5.0, "d": 4.0}
+    disagree = {"a": 7.0, "b": 6.0, "c": 3.0, "d": 2.0}
+    assert metrics.h4_perplexity_vs_judge(ppl, disagree).effect == 1.0
+
+
+def test_h4_uses_only_arms_with_both_measurements():
+    """`template` runs no model, so it HAS no perplexity. That is a property of
+    the arm, not a missing measurement."""
+    from src.eval import metrics
+
+    r = metrics.h4_perplexity_vs_judge(
+        {"a": 10.0, "b": 8.0, "c": 5.0},
+        {"a": 2.0, "b": 3.0, "c": 6.0, "template": 1.0})
+    assert r.detail["arms"] == ["a", "b", "c"]
+    assert r.n == 3
+
+
+def test_h4_refuses_too_few_arms():
+    """Spearman on two points is always +-1 and means nothing."""
+    from src.eval import metrics
+
+    try:
+        metrics.h4_perplexity_vs_judge({"a": 1.0, "b": 2.0},
+                                       {"a": 1.0, "b": 2.0})
+    except AssertionError as error:
+        assert "at least three arms" in str(error)
+        return
+    raise AssertionError("Spearman was computed on two arms")
+
+
+def test_adjust_refuses_a_mixed_judge_family():
+    """Holm ranks every p-value against every other, so a family spanning two
+    judges makes the primary's threshold depend on the secondary's scores.
+
+    Not hypothetical: a notebook loop rebound the H1/H2 list to the secondary
+    judge's results, and the 'primary judge' table silently became a mixed one
+    and dropped H1 and H2. Every number in it was real, and nothing raised."""
+    from src.eval import metrics
+
+    mixed = [metrics.Result(name="a", judge="gpt4o_mini", p_value=0.01),
+             metrics.Result(name="b", judge="gemini_flash", p_value=0.02)]
+    try:
+        metrics.adjust(mixed)
+    except AssertionError as error:
+        assert "gpt4o_mini" in str(error) and "gemini_flash" in str(error)
+        return
+    raise AssertionError("a correction family spanned two judges")
+
+
+def test_adjust_allows_mechanical_tests_beside_one_judge():
+    """H1 and H2 are substring checks with no judge, so they belong in a family
+    with either one."""
+    from src.eval import metrics
+
+    family = [metrics.Result(name="H1", judge="", p_value=0.001),
+              metrics.Result(name="H3", judge="gpt4o_mini", p_value=0.02)]
+    out = metrics.adjust(family)
+    assert all("p_adjusted" in r.detail for r in out)

@@ -309,6 +309,20 @@ def adjust(results: list[Result]) -> list[Result]:
     """
     from statsmodels.stats.multitest import multipletests
 
+    # **A correction family may not span two judges.** Holm's step-down ranks
+    # every p-value against every other, so mixing judges makes the primary's
+    # threshold depend on how the secondary happened to score — which is
+    # pooling, arrived at by a different route than averaging.
+    #
+    # This is not hypothetical: a notebook loop wrote `for name, results in
+    # h3.items()`, rebinding the H1/H2 list to the secondary judge's results.
+    # The "primary judge" table silently became a mixed-judge table and lost
+    # H1 and H2 entirely. Nothing raised, and every number in it was real.
+    #
+    # Mechanical tests carry an empty judge and are exempt: format compliance
+    # and grounding rate are substring checks, so they belong with either judge.
+    assert_single_judge(results)
+
     usable = [r for r in results if r.p_value == r.p_value]
     if not usable:
         return results
@@ -458,3 +472,85 @@ def compare_to_baseline(summary, column: str, baseline: str,
             int(base[successes]), int(base["n"]),
             name=f"{name or column} — {arm} vs {baseline}"))
     return results
+
+
+# --- H3 and H4 ----------------------------------------------------------------
+
+def h3_grounding_gap(scored: list[dict], baseline: str = "base_few",
+                     arms=None, condition: str = "mismatched_random",
+                     judge: str = "") -> list[Result]:
+    """H3 — does the grounding gap increase from ``baseline`` to the LoRA arms?
+
+    The pre-registered prediction is that it does **not**. Measured by the swap
+    test rather than by substring matching, which is what distinguishes H3 from
+    H2: H2 asks whether the model quotes correctly, H3 asks whether a judge can
+    tell the interpretation was written about this poem.
+
+    Mann-Whitney U on the per-poem gaps, as pre-registered. It is an unpaired
+    test applied to sets that happen to share their poems — that is the test the
+    pre-registration names, and swapping to a paired one after seeing the data
+    is the freedom pre-registration exists to remove. The pairing is used where
+    it was always going to be used: inside each arm's gap, which is already a
+    within-poem difference.
+
+    ``condition`` selects which gap. ``mismatched_random`` is the standard one;
+    ``mismatched_same_author`` gives the strict poem-level gap, which is the
+    defensible number because it survives author-prior leakage.
+    """
+    from src.eval import judge as judge_module
+
+    by_arm: dict[str, list[dict]] = {}
+    for record in scored:
+        if record.get("score") is not None:
+            by_arm.setdefault(record["arm"], []).append(record)
+
+    assert baseline in by_arm, f"{baseline!r} has no scored records"
+    base = judge_module.paired_differences(by_arm[baseline], "matched", condition)
+
+    results = []
+    for arm in (arms if arms is not None else sorted(by_arm)):
+        if arm == baseline or arm not in by_arm:
+            continue
+        gaps = judge_module.paired_differences(by_arm[arm], "matched", condition)
+        result = mann_whitney(gaps, base,
+                              name=f"H3 {condition} gap — {arm} vs {baseline}")
+        result.judge = judge
+        result.detail["mean_arm"] = sum(gaps) / len(gaps)
+        result.detail["mean_baseline"] = sum(base) / len(base)
+        results.append(result)
+    return results
+
+
+def h4_perplexity_vs_judge(perplexity: dict, judge_score: dict,
+                           judge: str = "") -> Result:
+    """H4 — do perplexity and judge score rank the arms differently?
+
+    Spearman across arms, as pre-registered. **Rank correlation, not Pearson**:
+    the prediction is about ORDERING, and the two quantities are not on a
+    comparable scale — one is a reciprocal geometric mean of token
+    probabilities, the other a 1-10 integer from a language model.
+
+    ``template`` has no perplexity — it runs no model at all — so it cannot
+    appear here. That is a property of the arm, not a missing measurement, and
+    dropping it silently would leave a reader wondering why n is 4.
+
+    With four arms this test has almost no power. That is a fact about the
+    design, not a result: reporting the coefficient without saying so would
+    dress up a number that cannot reach significance.
+    """
+    arms = sorted(set(perplexity) & set(judge_score))
+    assert len(arms) >= 3, (
+        f"H4 needs at least three arms with both measurements; got {arms}")
+
+    result = rank_correlation([perplexity[a] for a in arms],
+                              [judge_score[a] for a in arms],
+                              name="H4 perplexity vs judge score")
+    result.judge = judge
+    result.detail["arms"] = arms
+    result.detail["perplexity"] = [perplexity[a] for a in arms]
+    result.detail["judge_score"] = [judge_score[a] for a in arms]
+    # Lower perplexity is better and higher judge score is better, so agreement
+    # would be NEGATIVE correlation. Stated here because the sign is the entire
+    # finding and reading it backwards inverts the conclusion.
+    result.detail["agreement_sign"] = "negative r means the two agree"
+    return result
